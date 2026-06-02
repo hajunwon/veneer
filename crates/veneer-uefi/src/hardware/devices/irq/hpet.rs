@@ -62,10 +62,11 @@ static TIMER_CONFIG: [AtomicU64; N_TIMERS]    = [TIMER_INIT; N_TIMERS];
 static TIMER_COMPARE: [AtomicU64; N_TIMERS]   = [TIMER_INIT; N_TIMERS];
 static TIMER_FSB: [AtomicU64; N_TIMERS]       = [TIMER_INIT; N_TIMERS];
 
-/// Comparator value timer 0's interrupt deadline is armed against. When
-/// the guest writes a new comparator (TIMER_COMPARE[0] differs), the
-/// deadline re-arms. u64::MAX = consumed / not armed.
-static T0_ARMED_CMP: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Timer 0's live one-shot deadline — the main-counter value it fires at,
+/// or u64::MAX when disarmed. Armed by a guest comparator write (see the
+/// write handler), cleared by `timer0_serviced`. The power-on comparator
+/// (0) is never written, so it never arms — only an explicit guest write
+/// does, which is what distinguishes a real deadline from the stale default.
 static T0_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 #[inline]
@@ -173,29 +174,6 @@ fn t0_enabled() -> bool {
         && TIMER_CONFIG[0].load(Ordering::Relaxed) & TN_INT_ENB != 0
 }
 
-/// Re-arm the deadline if the guest reprogrammed timer 0's comparator.
-/// Returns the live deadline (u64::MAX = none).
-fn t0_sync() -> u64 {
-    let cmp = TIMER_COMPARE[0].load(Ordering::Relaxed);
-    if T0_ARMED_CMP.load(Ordering::Relaxed) != cmp {
-        T0_ARMED_CMP.store(cmp, Ordering::Relaxed);
-        // Arm only when the comparator is ahead of the monotonic counter. A
-        // comparator at or behind the current count — e.g. the power-on 0 the
-        // HAL leaves while it enables the timer's interrupt before writing a
-        // real match value — never matches on one-shot HPET hardware until the
-        // 64-bit counter wraps, so it must NOT fire. Treating past>=deadline as
-        // "fire now" injected the clock IRQ mid-HalpHpetSetMatchValue while the
-        // HAL held its timer spinlock; the ISR re-acquired it and the lone boot
-        // CPU self-deadlocked (KxWaitForSpinLockAndAcquire).
-        let deadline = if cmp > main_counter() { cmp } else { u64::MAX };
-        T0_DEADLINE.store(deadline, Ordering::Relaxed);
-        if TIMER_CONFIG[0].load(Ordering::Relaxed) & TN_TYPE_PERIODIC != 0 {
-            log_periodic_once();
-        }
-    }
-    T0_DEADLINE.load(Ordering::Relaxed)
-}
-
 static PERIODIC_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 fn log_periodic_once() {
@@ -207,7 +185,7 @@ fn log_periodic_once() {
 /// True when timer 0 is set up to raise interrupts (counter will reach
 /// the comparator on its own).
 pub fn timer0_armed() -> bool {
-    t0_enabled() && t0_sync() != u64::MAX
+    t0_enabled() && T0_DEADLINE.load(Ordering::Relaxed) != u64::MAX
 }
 
 /// Non-consuming: has timer 0's comparator match passed?
@@ -215,7 +193,7 @@ pub fn timer0_pending() -> bool {
     if !t0_enabled() {
         return false;
     }
-    let deadline = t0_sync();
+    let deadline = T0_DEADLINE.load(Ordering::Relaxed);
     deadline != u64::MAX && main_counter() >= deadline
 }
 
@@ -347,6 +325,20 @@ pub fn write_register_width(offset: u32, val: u64, width: u8) {
                 next &= !TN_CAP_BITS;
             }
             slot.store(next, Ordering::Relaxed);
+            // Arm timer 0's one-shot deadline at the written comparator. It
+            // fires when the main counter reaches it; a value already at or
+            // behind the counter fires on the next check — late but correct.
+            // The IRQL-gated V_IRQ delivery holds the IRQ if the guest is in a
+            // HIGH_LEVEL critical section, so firing-when-past no longer risks
+            // the HalpHpetSetMatchValue re-entrancy the old future-only arming
+            // guarded against. Only an explicit write arms, so the power-on 0
+            // comparator stays disarmed.
+            if timer == 0 && sub == 0x08 {
+                T0_DEADLINE.store(next, Ordering::Relaxed);
+                if TIMER_CONFIG[0].load(Ordering::Relaxed) & TN_TYPE_PERIODIC != 0 {
+                    log_periodic_once();
+                }
+            }
         }
         _ => {}
     }
