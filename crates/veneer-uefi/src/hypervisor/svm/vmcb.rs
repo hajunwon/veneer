@@ -177,6 +177,31 @@ pub mod intercept_vec2 {
     pub const XSETBV: u32 = 1 << 13;
 }
 
+/// `VmcbControl.vintr` field (offset 0x60) bit layout — AMD APM Vol 2
+/// §15.21.2 (Injecting Virtual Interrupts). veneer raises maskable guest
+/// interrupts through V_IRQ so the CPU gates delivery on V_TPR (the guest's
+/// virtualised IRQL/CR8) and guest IF, exactly as physical interrupt
+/// acceptance does — rather than the unconditional event_inj path.
+pub mod vintr {
+    /// V_TPR — bits 7:0. Bits 3:0 hold the guest CR8 (task priority / IRQL);
+    /// the CPU maintains this when CR8 is left un-intercepted.
+    pub const V_TPR_MASK: u64 = 0xFF;
+    /// V_IRQ (bit 8) — a virtual interrupt is pending. Hardware clears it
+    /// once the interrupt is delivered to the guest.
+    pub const V_IRQ: u64 = 1 << 8;
+    /// V_INTR_PRIO (bits 19:16) — priority of the pending virtual interrupt.
+    /// Delivered only when V_INTR_PRIO > V_TPR (unless V_IGN_TPR).
+    pub const V_INTR_PRIO_SHIFT: u64 = 16;
+    /// V_IGN_TPR (bit 20) — ignore V_TPR when deciding to deliver. Left clear
+    /// so IRQL gating applies.
+    pub const V_IGN_TPR: u64 = 1 << 20;
+    /// V_INTR_MASKING (bit 24) — virtualise guest IF/TPR; physical IRQs use
+    /// host IF.
+    pub const V_INTR_MASKING: u64 = 1 << 24;
+    /// V_INTR_VECTOR (bits 39:32) — the vector delivered when V_IRQ fires.
+    pub const V_INTR_VECTOR_SHIFT: u64 = 32;
+}
+
 /// AMD APM Vol 2 §15.9 / Appendix C. Only the exit codes veneer cares about.
 /// (Cross-checked against Linux KVM's `arch/x86/include/uapi/asm/svm.h`.)
 pub mod exit_code {
@@ -295,11 +320,15 @@ pub unsafe fn init_for_cpuid_intercept(vmcb: *mut Vmcb, msrpm_phys: u64, iopm_ph
     // later (shadow #PF, emulate #UD, etc.). For the current guest none
     // should fire — any that does means a host or VMCB bug.
     c.intercept_exceptions = 0xFFFF_FFFF;
-    // Trap every CR access (CR0..CR15 read/write) and every DR access. The
-    // intercept_cr_read/write and intercept_dr_read/write bitmaps have one
-    // bit per register; 0xFFFF = trap them all. Handlers route per register.
-    c.intercept_cr_read = 0xFFFF;
-    c.intercept_cr_write = 0xFFFF;
+    // Trap every CR access (CR0..CR15 read/write) and every DR access, EXCEPT
+    // CR8. Bit 8 = CR8 = the task-priority register the guest uses for IRQL.
+    // Under V_INTR_MASKING the CPU virtualises guest CR8 into VMCB V_TPR
+    // (bits 3:0) with no exit; intercepting it instead would route the write
+    // here where there's no V_TPR plumbing, so the guest's IRQL would never
+    // reach V_TPR and interrupt delivery couldn't honour it. Leave CR8 to the
+    // hardware so V_TPR tracks the guest's current IRQL.
+    c.intercept_cr_read = 0xFFFF & !(1 << 8);
+    c.intercept_cr_write = 0xFFFF & !(1 << 8);
     c.intercept_dr_read = 0xFFFF;
     c.intercept_dr_write = 0xFFFF;
     c.guest_asid = 1;

@@ -1,17 +1,17 @@
 //! Interrupt-injection layer.
 //!
 //! After every VMEXIT handler runs, before the next VMRUN, we check for
-//! pending interrupts that should be delivered to the guest and stage
-//! them in `VMCB.control.event_inj`. Hardware then injects on VMRUN
-//! entry exactly as if the interrupt had arrived between instructions.
+//! pending interrupts that should be delivered to the guest. Maskable
+//! interrupts are raised through the AMD virtual-interrupt mechanism
+//! (`VMCB.control.vintr` V_IRQ); the CPU then delivers them only when the
+//! guest has IF set and the vector's priority class exceeds V_TPR (the
+//! guest's IRQL, virtualised from CR8) — so an interrupt never pre-empts a
+//! higher-IRQL critical section. The earlier event_inj path bypassed V_TPR
+//! and delivered unconditionally, which let a timer fire into a HIGH_LEVEL
+//! HAL critical section and self-deadlock (KxWaitForSpinLock).
 //!
-//! AMD APM Vol 2 §15.20: event_inj layout (64-bit field at VMCB offset
-//! 0x0A8):
-//!   bits  7:0   vector
-//!   bits 10:8   type — 0=ExtINT, 2=NMI, 3=#XCP (exception), 4=software
-//!   bit  11     error code valid
-//!   bit  31     valid (must be 1)
-//!   bits 63:32  error code (when bit 11 set)
+//! NMIs are still injected via event_inj (AMD APM Vol 2 §15.20) — they are
+//! non-maskable and bypass IF/TPR by design.
 //!
 //! Sources of pending interrupts:
 //!   - LAPIC periodic / one-shot timer (LVT Timer counter hit 0)
@@ -27,20 +27,15 @@
 //! exit-code switch. A standalone module keeps `dispatch` focused on
 //! routing and `inject` focused on delivery policy.
 
-use crate::hypervisor::svm::vmcb::Vmcb;
+use crate::hypervisor::svm::vmcb::{vintr, Vmcb, VmcbControl};
 
 use crate::hardware::devices::storage::{ahci, nvme};
 use crate::hardware::devices::i8042;
 use super::{hpet, ioapic, lapic, pic, pit, rtc};
 
-/// AMD event_inj type field encodings.
-const TYPE_EXTINT: u64 = 0;
-#[allow(dead_code)]
-const TYPE_NMI:    u64 = 2;
-#[allow(dead_code)]
-const TYPE_EXCEPT: u64 = 3;
-#[allow(dead_code)]
-const TYPE_SWINT:  u64 = 4;
+/// AMD event_inj type field encodings. Only NMI is delivered via event_inj
+/// now — maskable interrupts go through V_IRQ so the CPU honours V_TPR.
+const TYPE_NMI: u64 = 2;
 
 /// Bit 31 of event_inj — set marks the slot live for the next VMRUN.
 const VALID: u64 = 1 << 31;
@@ -64,12 +59,20 @@ fn throttle(c: &core::sync::atomic::AtomicU64, every: u64) -> bool {
     n < 4 || n % every == 0
 }
 
-/// Compose an event_inj entry for an external interrupt with `vector`.
-/// External interrupts don't carry an error code, so bits 32..63 are 0
-/// and bit 11 (error code valid) stays clear.
+/// Raise `vector` as a virtual interrupt (AMD V_IRQ). The CPU delivers it
+/// to the guest once GIF=1, guest IF=1 and the vector's priority class
+/// exceeds V_TPR (the guest's IRQL, virtualised from CR8); until then it
+/// stays pending and the CPU delivers it autonomously when the guest lowers
+/// IRQL. Preserves V_TPR and V_INTR_MASKING and leaves V_IGN_TPR clear so
+/// IRQL gating applies — this is the path event_inj bypassed.
 #[inline]
-fn extint_event(vector: u8) -> u64 {
-    (vector as u64) | (TYPE_EXTINT << 8) | VALID
+fn raise_virq(c: &mut VmcbControl, vector: u8) {
+    let prio = (vector as u64 >> 4) & 0xF;
+    let keep = c.vintr & (vintr::V_TPR_MASK | vintr::V_INTR_MASKING);
+    c.vintr = keep
+        | vintr::V_IRQ
+        | (prio << vintr::V_INTR_PRIO_SHIFT)
+        | ((vector as u64) << vintr::V_INTR_VECTOR_SHIFT);
 }
 
 /// Record an edge-triggered interrupt as in-service in the LAPIC ISR so
@@ -123,9 +126,18 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
         c.event_inj = (TYPE_NMI << 8) | VALID;
         return;
     }
-    // External maskable interrupts only deliver when the guest has IF set
-    // and isn't in an interrupt shadow (the boundary right after STI /
-    // MOV SS). Injecting through either would violate the guest's masking.
+    // A virtual interrupt is already programmed but the CPU hasn't delivered
+    // it yet — it's holding it behind guest IF or V_TPR (IRQL). Don't stack
+    // another; hardware delivers it autonomously once the guest allows, and
+    // V_IRQ auto-clears on delivery so the next pass programs the next one.
+    if c.vintr & vintr::V_IRQ != 0 {
+        return;
+    }
+    // Stage maskable interrupts only when the guest has IF set and isn't in
+    // an interrupt shadow (the boundary right after STI / MOV SS). Hardware
+    // also gates V_IRQ on guest IF, but this early-out keeps a pending IRQ in
+    // its source (and the LAPIC IRR) at IF=0 so a guest polling IRR still
+    // sees it, rather than consuming it into a deferred V_IRQ slot.
     let rflags = unsafe { (*vmcb).state.rflags };
     if rflags & (1 << 9) == 0 || c.interrupt_shadow & 1 != 0 {
         return;
@@ -134,13 +146,13 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
     //    command completes so the driver's wait wakes immediately.
     if let Some(vector) = nvme::pending_irq() {
         if throttle(&NVME_INJ, 4096) { crate::sprintln!("[inject] nvme-msix vec=0x{:X}", vector); }
-        c.event_inj = extint_event(vector);
+        raise_virq(c, vector);
         deliver_edge(vector);
         return;
     }
     if let Some(vector) = ahci::pending_irq() {
         if throttle(&AHCI_INJ, 4096) { crate::sprintln!("[inject] ahci-msi vec=0x{:X}", vector); }
-        c.event_inj = extint_event(vector);
+        raise_virq(c, vector);
         deliver_edge(vector);
         return;
     }
@@ -150,7 +162,7 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
         match gsi_vector(1) {
             Some(vector) => {
                 crate::sprintln!("[inject] kbd-irq1 vec=0x{:X}", vector);
-                c.event_inj = extint_event(vector);
+                raise_virq(c, vector);
                 deliver_gsi(1, vector);
                 i8042::irq1_serviced();
                 return;
@@ -160,7 +172,7 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
     }
     // 1. LAPIC timer — periodic / one-shot scheduler tick.
     if let Some(vector) = lapic::timer_pending(0) {
-        c.event_inj = extint_event(vector);
+        raise_virq(c, vector);
         deliver_edge(vector);
         lapic::timer_serviced(0);
         let n = LAPIC_TIMER_INJ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -177,7 +189,7 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
         match gsi_vector(hpet::timer0_gsi()) {
             Some(vector) => {
                 crate::sprintln!("[inject] hpet vec=0x{:X}", vector);
-                c.event_inj = extint_event(vector);
+                raise_virq(c, vector);
                 deliver_gsi(hpet::timer0_gsi(), vector);
                 hpet::timer0_serviced();
                 return;
@@ -197,7 +209,7 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
         match irq0_vector() {
             Some(vector) => {
                 if throttle(&PIT_INJ, 8192) { crate::sprintln!("[inject] pit-irq0 vec=0x{:X}", vector); }
-                c.event_inj = extint_event(vector);
+                raise_virq(c, vector);
                 // IRQ0 is overridden to GSI2 on a real PC; reflect that
                 // entry's trigger mode (edge for the PIT tick).
                 deliver_gsi(2, vector);
@@ -224,7 +236,7 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
         match gsi_vector(8) {
             Some(vector) => {
                 crate::sprintln!("[inject] rtc-irq8 vec=0x{:X}", vector);
-                c.event_inj = extint_event(vector);
+                raise_virq(c, vector);
                 deliver_gsi(8, vector);
                 rtc::irq8_serviced();
                 return;
@@ -234,9 +246,11 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
         }
     }
     // 5. LAPIC self-IPI (ICR write to "self" / "all incl self" shorthand).
+    //    Raised as a virtual interrupt; the CPU holds it behind V_TPR so a
+    //    low-priority self-IPI can't re-enter a higher-IRQL critical section.
     if let Some(vector) = lapic::ipi_pending(0) {
         crate::sprintln!("[inject] self-ipi vec=0x{:X}", vector);
-        c.event_inj = extint_event(vector);
+        raise_virq(c, vector);
         deliver_edge(vector);
         return;
     }
