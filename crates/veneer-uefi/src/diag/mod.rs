@@ -4,3 +4,4 @@
 pub mod serial_kd;
 pub mod validator;
 pub mod report;
+pub mod snapshot;

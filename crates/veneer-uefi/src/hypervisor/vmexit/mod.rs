@@ -96,6 +96,12 @@ fn rdtsc_raw() -> u64 {
     ((hi as u64) << 32) | (lo as u64)
 }
 const SPIN_THRESHOLD: u32 = 16;
+/// Far above SPIN_THRESHOLD (the convergence-floor trigger): a same-RIP run
+/// this long is a wedge (deadlock), not a delay loop. Fires one diag snapshot.
+const DIAG_SPIN_THRESHOLD: u32 = 20_000;
+const DIAG_DUMP_CAP: u32 = 3;
+static DIAG_LAST_PAGE: AtomicU64 = AtomicU64::new(0);
+static DIAG_DUMPS: AtomicU32 = AtomicU32::new(0);
 
 pub mod cpuid;
 pub mod cr;
@@ -148,6 +154,19 @@ pub unsafe fn dispatch(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
             0
         };
         crate::infra::clock::set_spin_floor(floor);
+        // Sustained same-RIP spin far past the floor threshold = a real wedge.
+        // Fire once per distinct stall page (cap a few) so a transient earlier
+        // spin AND the terminal wedge are both captured if they differ.
+        if count >= DIAG_SPIN_THRESHOLD {
+            let page = rip & !0xFFF;
+            if DIAG_LAST_PAGE.load(Ordering::Relaxed) != page
+                && DIAG_DUMPS.load(Ordering::Relaxed) < DIAG_DUMP_CAP
+            {
+                DIAG_LAST_PAGE.store(page, Ordering::Relaxed);
+                DIAG_DUMPS.fetch_add(1, Ordering::Relaxed);
+                unsafe { crate::diag::snapshot::dump(vmcb, gprs, "sustained-spin") };
+            }
+        }
     }
 
     // Real-time RIP profiler: VMEXITs in the slow phase are dominated by the
