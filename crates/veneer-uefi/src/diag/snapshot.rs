@@ -83,8 +83,8 @@ pub unsafe fn dump(vmcb: *mut Vmcb, gprs: &GuestGprs, reason: &str) {
         if exit_code == VMEXIT_NPF { "  (NPF: info2=faulting GPA, info1=flags)" } else { "" }
     );
     crate::sprintln!(
-        "[diag] rsp=0x{:X} cr3=0x{:X} rflags=0x{:X} (IF={}) cpl={} vtpr=0x{:02X}(cr8={})",
-        rsp, cr3, rflags, (rflags >> 9) & 1, cpl, vtpr, vtpr >> 4
+        "[diag] rsp=0x{:X} cr3=0x{:X} rflags=0x{:X} (IF={}) cpl={} vtpr=0x{:02X}(irql/cr8={})",
+        rsp, cr3, rflags, (rflags >> 9) & 1, cpl, vtpr, vtpr & 0xF
     );
     crate::sprintln!(
         "[diag] rdi=0x{:X} rsi=0x{:X} rbp=0x{:X} rbx=0x{:X} rcx=0x{:X} rdx=0x{:X} rax=0x{:X}",
