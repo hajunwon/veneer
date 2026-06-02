@@ -129,6 +129,15 @@ pub unsafe fn handle(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
     let fetched = c.guest_inst_len as usize;
     let bytes = unsafe { &(*vmcb).control.guest_inst_bytes };
     let valid = &bytes[..fetched.min(bytes.len())];
+
+    // REP MOVS between a device BAR and RAM (Windows READ/WRITE_REGISTER_
+    // BUFFER_*). The single-MOV decoder can't model a string copy, so
+    // emulate it: route the MMIO side through the region emulator and the
+    // RAM side through guest-virtual memory.
+    if unsafe { emulate_rep_movs(vmcb, gprs, gpa, info1, region.as_ref(), valid) } {
+        return Action::Resume;
+    }
+
     let decoded = match decode::decode_mov(valid) {
         Some(d) if d.len > 0 => d,
         _ => {
@@ -136,8 +145,8 @@ pub unsafe fn handle(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
             if n < 8 {
                 let b = valid;
                 sprintln!(
-                    "[npf] DECODE FAIL gpa=0x{:X} info1=0x{:X} rip=0x{:X} ilen={} bytes={:02X?}",
-                    gpa, info1, rip, fetched, b
+                    "[npf] DECODE FAIL gpa=0x{:X} region={} info1=0x{:X} rip=0x{:X} ilen={} bytes={:02X?} rsi=0x{:X} rdi=0x{:X} rcx=0x{:X}",
+                    gpa, region_name(gpa), info1, rip, fetched, b, gprs.rsi, gprs.rdi, gprs.rcx
                 );
             }
             return Action::Abort;
@@ -189,6 +198,111 @@ pub unsafe fn handle(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
 
     s.rip = s.rip.wrapping_add(decoded.len);
     Action::Resume
+}
+
+#[inline]
+fn bytes_to_u64(b: &[u8]) -> u64 {
+    let mut v = 0u64;
+    for (i, &x) in b.iter().enumerate() {
+        v |= (x as u64) << (i * 8);
+    }
+    v
+}
+
+#[inline]
+fn u64_to_bytes(v: u64, b: &mut [u8]) {
+    for (i, x) in b.iter_mut().enumerate() {
+        *x = (v >> (i * 8)) as u8;
+    }
+}
+
+/// Emulate a `REP MOVS` whose source or destination is trapped MMIO.
+/// Windows' READ_REGISTER_BUFFER_* / WRITE_REGISTER_BUFFER_* helpers copy
+/// between a device BAR and RAM with `rep movsd`/`movsb`, which the
+/// single-MOV NPF decoder can't model. Copy `RCX` elements one at a time:
+/// the MMIO side goes through the region emulator, the RAM side through
+/// guest-virtual memory (translated under the guest CR3). Returns true when
+/// the instruction was a REP MOVS and has been fully emulated (RIP/RSI/RDI/
+/// RCX advanced). Non-MOVS or non-REP encodings return false to fall back
+/// to the single-MOV path.
+unsafe fn emulate_rep_movs(
+    vmcb: *mut Vmcb,
+    gprs: &mut GuestGprs,
+    gpa: u64,
+    info1: u64,
+    region: Option<&TrapRegion>,
+    bytes: &[u8],
+) -> bool {
+    // Parse legacy prefixes + REX ahead of the opcode. REP (F3) is required;
+    // 66 selects 2-byte operands, REX.W selects 8-byte; A4=MOVSB (1 byte),
+    // A5=MOVS{W,D,Q} (operand-size).
+    let mut i = 0;
+    let mut rep = false;
+    let mut opsize_66 = false;
+    let mut rex_w = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            0xF3 | 0xF2 => { rep = true; i += 1; }
+            0x66 => { opsize_66 = true; i += 1; }
+            0x67 => { i += 1; }                       // addr-size override
+            0x40..=0x4F => { rex_w = bytes[i] & 0x08 != 0; i += 1; }
+            _ => break,
+        }
+    }
+    if !rep || i >= bytes.len() {
+        return false;
+    }
+    let size: u64 = match bytes[i] {
+        0xA4 => 1,
+        0xA5 => if rex_w { 8 } else if opsize_66 { 2 } else { 4 },
+        _ => return false,
+    };
+    let instr_len = (i + 1) as u64;
+
+    let s = unsafe { &mut (*vmcb).state };
+    let cr3 = s.cr3;
+    let df = (s.rflags >> 10) & 1 != 0;
+    let step = if df { size.wrapping_neg() } else { size };
+    // exit_info_1 bit 1 (RW): 1 = the faulting access was a write, so the
+    // MMIO operand is the destination (RDI); otherwise it's the source (RSI).
+    let mmio_is_dst = info1 & (1 << 1) != 0;
+
+    let count = gprs.rcx;
+    let mut rsi = gprs.rsi;
+    let mut rdi = gprs.rdi;
+    let mut mmio = gpa;
+    let w = size as usize;
+    for _ in 0..count {
+        let mut buf = [0u8; 8];
+        if mmio_is_dst {
+            // RAM[RSI] -> MMIO[RDI]
+            if !crate::introspect::mem::read_virt(cr3, rsi, &mut buf[..w]) {
+                break;
+            }
+            let val = bytes_to_u64(&buf[..w]);
+            if let Some(r) = region {
+                r.write(mmio, val, size as u8);
+            }
+        } else {
+            // MMIO[RSI] -> RAM[RDI]
+            let val = match region {
+                Some(r) => r.read(mmio, size as u8),
+                None => 0,
+            };
+            u64_to_bytes(val, &mut buf[..w]);
+            if !crate::introspect::mem::write_virt(cr3, rdi, &buf[..w]) {
+                break;
+            }
+        }
+        rsi = rsi.wrapping_add(step);
+        rdi = rdi.wrapping_add(step);
+        mmio = mmio.wrapping_add(step);
+    }
+    gprs.rsi = rsi;
+    gprs.rdi = rdi;
+    gprs.rcx = 0;
+    s.rip = s.rip.wrapping_add(instr_len);
+    true
 }
 
 /// Sign-extend a `width`-byte value held in the low bits of `val` to 64 bits.
