@@ -164,9 +164,10 @@ pub fn set_in_service(slot: usize, vector: u8, level: bool) {
 }
 
 /// Mark `vector` as requested (pending) on `slot` without putting it in
-/// service. Used for completeness when a source is staged but masking /
-/// priority defers actual delivery.
-#[allow(dead_code)]
+/// service. Real hardware sets the IRR bit the moment an interrupt is
+/// requested; software (e.g. HalpApicRequestInterrupt) polls IRR to confirm a
+/// self-IPI registered before delivery. `set_in_service` clears it once the
+/// interrupt is finally injected.
 pub fn set_requested(slot: usize, vector: u8) {
     if vector >= 16 {
         bitmap_set(&IRR[slot], vector);
@@ -542,6 +543,12 @@ pub fn write_register_width(offset: u32, val: u64, width: u8) {
                     // Fixed / lowest-priority — ordinary vectored IPI.
                     if targets_self && vector >= 16 {
                         PENDING_IPI[slot].store(vector, Ordering::Relaxed);
+                        // Reflect the request in IRR so a guest that polls IRR
+                        // (HalpApicRequestInterrupt) sees the self-IPI pending.
+                        // Without this it tracks only in PENDING_IPI and the
+                        // poll spins forever (esp. at IF=0, when stage_pending
+                        // won't inject). Cleared by set_in_service on delivery.
+                        set_requested(slot, vector as u8);
                     }
                 }
                 0b100 => {
