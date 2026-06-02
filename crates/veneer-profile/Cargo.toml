@@ -1,0 +1,11 @@
+[package]
+name        = "veneer-profile"
+version     = "0.0.5"
+edition     = "2021"
+description = "Shared synthetic-PC profile schema (no_std, NVRAM-layout) used by the veneer hypervisor and the host tools."
+authors     = ["hajunwon210"]
+license     = "MIT"
+
+[lib]
+name = "veneer_profile"
+path = "src/lib.rs"

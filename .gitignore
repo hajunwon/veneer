@@ -1,0 +1,7 @@
+# Rust / Cargo build output (includes the make_disk.py deploy artifacts:
+# veneer-esp-flat.vmdk, veneer.iso, *.vmdk.lck — all regenerable).
+/target
+
+# Python caches
+**/__pycache__/
+*.pyc

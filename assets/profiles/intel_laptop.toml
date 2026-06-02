@@ -1,0 +1,25 @@
+name = "default"
+
+[hardware.cpu]
+brand = "Intel(R) Core(TM) i7-12700K @ 3.60GHz"
+vendor = "GenuineIntel"
+hide_hypervisor_bit = false
+hide_hypervisor_leaf = false
+
+[hardware.smbios]
+manufacturer = "LENOVO"
+product = "20XK0019KR"
+serial = "PF3X4K9Z"
+version = "ThinkPad T14 Gen 3"
+uuid = "5e9c2f8b-3a14-4e2d-9c61-7f1a8d4e5b06"
+bios_vendor = "LENOVO"
+bios_version = "R23ET75W (1.50)"
+bios_date = "06/14/2024"
+
+[hardware.network]
+mac = "00:1B:21:7C:4A:3F"
+
+[[hardware.disks]]
+slot = "nvme0:0"
+serial = "S6Y1NX0T901234"
+model = "Samsung SSD 980 PRO 1TB"

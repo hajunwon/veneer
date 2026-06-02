@@ -1,0 +1,21 @@
+[package]
+name        = "veneer-uefi"
+version     = "0.0.5"
+edition     = "2021"
+description = "veneer hypervisor — UEFI bootloader. no_std application loaded by firmware before the guest OS."
+authors     = ["hajunwon210"]
+license     = "MIT"
+
+[dependencies]
+uefi = { version = "0.32", features = ["panic_handler", "logger", "alloc", "global_allocator"] }
+log  = "0.4"
+veneer-profile = { path = "../veneer-profile" }
+
+# TPM 2.0 crypto — vetted no_std RustCrypto primitives.
+rsa = { version = "0.9", default-features = false }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh"] }
+rand_core = { version = "0.6", default-features = false }
+
+[[bin]]
+name = "veneer-uefi"
+path = "src/main.rs"

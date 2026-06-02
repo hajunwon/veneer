@@ -1,0 +1,35 @@
+# veneer behavior config
+#
+# Knobs that govern how veneer itself operates — not what the guest
+# sees. Layered: compile-time DEFAULT → NVRAM "VeneerConfig" cache →
+# this file (when present on ESP).
+
+[menu]
+timeout_secs = 5
+force_show   = false
+
+[policy]
+default        = "amd_desktop"      # "intel_laptop" / "amd_desktop" / "ryzen_nuc"
+prompt_on_miss = true
+
+[log]
+serial  = "verbose"    # "none" / "minimal" / "verbose"
+console = "minimal"
+
+[intercept]
+lapic_emulation  = true
+vmware_backdoor  = "block"          # "block" / "passthrough"
+ap_probe         = true
+bsp_self_test    = false
+multi_vcpu_vmrun = true
+rdrand_intercept = false
+
+[timing]
+rdtsc_stride      = 30
+rdtsc_seed        = 0x1000000000000000
+vmmcall_signature = 0xC0FFEEC0FFEEBEEF
+
+[runtime]
+max_vmrun_iters = 32
+asid_base_bsp   = 1
+asid_base_ap    = 2

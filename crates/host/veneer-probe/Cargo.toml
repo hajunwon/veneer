@@ -1,0 +1,22 @@
+[package]
+name        = "veneer-probe"
+version     = "0.0.5"
+edition     = "2021"
+description = "veneer host-side pre-flight — probe host CPU/virtualization capability and validate synthetic-PC profiles before deploying the hypervisor."
+authors     = ["hajunwon210"]
+license     = "MIT"
+
+[dependencies]
+anyhow    = "1"
+thiserror = "1"
+bitflags  = "2"
+raw-cpuid = "11"
+veneer-profile = { path = "../../veneer-profile" }
+
+[lib]
+name = "veneer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "veneer"
+path = "src/main.rs"

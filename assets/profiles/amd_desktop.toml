@@ -1,0 +1,48 @@
+# veneer profile overlay
+#
+# Values here override the policy-generated profile after the RDRAND
+# template + randomization pass. Anything you do NOT set falls back to
+# the policy default + per-boot random fields.
+#
+# Apply path: NVRAM "VeneerProfile" → ESP overlay (this file when the
+# user picks "Load profile.toml" from the menu) → handler runtime read.
+#
+# Schema is byte-compatible with vmlatch's profile.toml so the same
+# file can drive either tool.
+
+name = "amd_desktop_overlay"
+
+[hardware.cpu]
+brand  = "AMD Ryzen 9 7900X 12-Core Processor"
+vendor = "AuthenticAMD"
+hide_hypervisor_bit  = true
+hide_hypervisor_leaf = true
+tsc_seed             = 0x1000000000000000
+microcode_signature  = 0
+platform_id          = 0
+
+[hardware.smbios]
+manufacturer = "ASUSTeK COMPUTER INC."
+product      = "ROG STRIX X670E-E GAMING WIFI"
+version      = "Rev 1.xx"
+bios_vendor  = "American Megatrends Inc."
+bios_version = "1820"
+bios_date    = "09/05/2024"
+
+[hardware.network]
+# Leave empty to let RDRAND randomize. To pin a specific MAC, set here.
+
+[hardware.disk]
+slot  = "nvme0:0"
+model = "WD_BLACK SN850X 2000GB"
+
+# SoftwareProfile fields — veneer doesn't enforce these (OS-level
+# values that can break Windows login if changed mid-session). Tools
+# like fake-vgc / vmlatch read the same TOML to apply at their layer.
+[software.os]
+product_name  = "Windows 11 Pro"
+edition_id    = "Professional"
+
+[software.locale]
+language = "en-US"
+timezone = "Asia/Seoul"
