@@ -461,6 +461,10 @@ const LAPIC_TRACE_CAP: u32 = 0;
 static TIMER_TRACE: AtomicU32 = AtomicU32::new(0);
 const TIMER_TRACE_CAP: u32 = 24;
 
+/// Sparse sampling of the hot ICR-write path (self-IPIs fire every
+/// scheduler pass — logging each one crawls the guest on the slow UART).
+static ICR_TRACE: AtomicU32 = AtomicU32::new(0);
+
 pub fn read_register_width(offset: u32, width: u8) -> u64 {
     let aligned = offset & !0x3;
     let shift_bits = (offset & 0x3) * 8;
@@ -530,10 +534,16 @@ pub fn write_register_width(offset: u32, val: u64, width: u8) {
             let shorthand = (new >> 18) & 0x3;
             let delivery = (new >> 8) & 0x7;
             let vector = new & 0xFF;
-            crate::sprintln!(
-                "[icr] val=0x{:X} vec=0x{:X} delivery={} shorthand={}",
-                new, vector, delivery, shorthand
-            );
+            // ICR writes are hot (self-IPIs every scheduler pass); a serial
+            // line each pins the emulated UART and crawls the guest. Trace a
+            // sparse sample.
+            let icr_n = ICR_TRACE.fetch_add(1, Ordering::Relaxed);
+            if icr_n < 4 || icr_n % 16384 == 0 {
+                crate::sprintln!(
+                    "[icr] val=0x{:X} vec=0x{:X} delivery={} shorthand={}",
+                    new, vector, delivery, shorthand
+                );
+            }
             // Delivery mode (ICR bits 10:8): 0=Fixed, 4=NMI, 5=INIT,
             // 6=Startup(SIPI). Only "self" / "all incl self" shorthands
             // target this lone vCPU; other destinations have no recipient.

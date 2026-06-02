@@ -44,6 +44,9 @@ static LAPIC_TIMER_INJ: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 static NVME_INJ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static AHCI_INJ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static PIT_INJ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static HPET_INJ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static IPI_INJ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static KBD_INJ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 // Diagnostic (winload native-spin investigation): counts pending-but-dropped
 // timer IRQs (route masked) and firmware-region idle passes. Remove once the
 // spin is understood.
@@ -161,7 +164,7 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
     if i8042::irq1_pending() {
         match gsi_vector(1) {
             Some(vector) => {
-                crate::sprintln!("[inject] kbd-irq1 vec=0x{:X}", vector);
+                if throttle(&KBD_INJ, 4096) { crate::sprintln!("[inject] kbd-irq1 vec=0x{:X}", vector); }
                 raise_virq(c, vector);
                 deliver_gsi(1, vector);
                 i8042::irq1_serviced();
@@ -188,7 +191,7 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
     if hpet::timer0_pending() {
         match gsi_vector(hpet::timer0_gsi()) {
             Some(vector) => {
-                crate::sprintln!("[inject] hpet vec=0x{:X}", vector);
+                if throttle(&HPET_INJ, 16384) { crate::sprintln!("[inject] hpet vec=0x{:X}", vector); }
                 raise_virq(c, vector);
                 deliver_gsi(hpet::timer0_gsi(), vector);
                 hpet::timer0_serviced();
@@ -249,7 +252,7 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
     //    Raised as a virtual interrupt; the CPU holds it behind V_TPR so a
     //    low-priority self-IPI can't re-enter a higher-IRQL critical section.
     if let Some(vector) = lapic::ipi_pending(0) {
-        crate::sprintln!("[inject] self-ipi vec=0x{:X}", vector);
+        if throttle(&IPI_INJ, 16384) { crate::sprintln!("[inject] self-ipi vec=0x{:X}", vector); }
         raise_virq(c, vector);
         deliver_edge(vector);
         return;
