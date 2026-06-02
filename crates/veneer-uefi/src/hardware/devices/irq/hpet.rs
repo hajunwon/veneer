@@ -179,7 +179,16 @@ fn t0_sync() -> u64 {
     let cmp = TIMER_COMPARE[0].load(Ordering::Relaxed);
     if T0_ARMED_CMP.load(Ordering::Relaxed) != cmp {
         T0_ARMED_CMP.store(cmp, Ordering::Relaxed);
-        T0_DEADLINE.store(cmp, Ordering::Relaxed);
+        // Arm only when the comparator is ahead of the monotonic counter. A
+        // comparator at or behind the current count — e.g. the power-on 0 the
+        // HAL leaves while it enables the timer's interrupt before writing a
+        // real match value — never matches on one-shot HPET hardware until the
+        // 64-bit counter wraps, so it must NOT fire. Treating past>=deadline as
+        // "fire now" injected the clock IRQ mid-HalpHpetSetMatchValue while the
+        // HAL held its timer spinlock; the ISR re-acquired it and the lone boot
+        // CPU self-deadlocked (KxWaitForSpinLockAndAcquire).
+        let deadline = if cmp > main_counter() { cmp } else { u64::MAX };
+        T0_DEADLINE.store(deadline, Ordering::Relaxed);
         if TIMER_CONFIG[0].load(Ordering::Relaxed) & TN_TYPE_PERIODIC != 0 {
             log_periodic_once();
         }

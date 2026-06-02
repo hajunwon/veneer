@@ -279,10 +279,10 @@ def main() -> int:
                          "(repeatable). E.g. --marker '[inject] hpet' to stop "
                          "watching once the guest reaches a known point.")
     ap.add_argument("--kd", action="store_true",
-                    help="KD-session preset: implies --gui --no-stop --no-stall "
-                         "and a long timeout. Boots the VM and watches without "
-                         "ever killing it, so you can attach WinDbg/kd to the "
-                         "COM2 pipe.")
+                    help="KD-session preset: implies --no-stop --no-stall and a "
+                         "long timeout, headless (no GPU render path). Boots the "
+                         "VM and watches without ever killing it, so you can "
+                         "attach WinDbg/kd to the COM2 pipe. Add --gui to watch.")
     ap.add_argument("--attach-kd", metavar="CMDS", default=None,
                     help="after the watch loop, break into the guest over the "
                          "COM2 KD pipe and run these debugger commands (e.g. "
@@ -309,7 +309,11 @@ def main() -> int:
     no_stall = args.no_stall
     timeout = args.timeout
     if args.kd:
-        gui = True
+        # KD runs headless: the debugger attaches over the COM2 named pipe and
+        # the cdboot keypress is synthesised in-hypervisor (i8042
+        # auto_boot_key_tick), so no VMware window is needed. A window renders
+        # the guest framebuffer through the host GPU driver, which BSOD'd the
+        # host (0x3B nvlddmkm). Pass --gui explicitly only to watch the screen.
         no_stop = True
         no_stall = True
         if timeout == 120.0:  # not overridden — KD sessions run long
