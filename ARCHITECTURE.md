@@ -85,29 +85,35 @@ Domain folders (file = responsibility, folder = module boundary, DAG only).
 ```
 crates/veneer-uefi/src/
 ├── main.rs            UEFI entry + boot orchestration (composition root)
-├── arch.rs            raw x86-64 primitives: cpuid/rdmsr/wrmsr/in/out/cr/hlt (HAL)
-├── boot/              chain_load, esp_io, guest_blob, guest_mem, linux_loader,
-│                      menu, uefi_config — bring the guest up
-├── svm/               AMD virtualization engine:
-│                      vmcb, vmrun, npt, msrpm, iopm, smp, vcpu_pool, gprs,
-│                      + arm_exec_trap (NX hook primitive)
-├── vmexit/            exit dispatch + CPU-instruction handlers:
-│                      mod(dispatch), decode, lengths, cpuid, msr, cr, dr, dt,
-│                      exception, hlt, rdtsc, vmmcall, stealth, io, npf
-├── devices/           emulated hardware:
-│   ├── irq/           lapic, ioapic, pic, pit, hpet, rtc, inject
-│   ├── bus/           pci, xhci, vga, nic
-│   ├── storage/       ahci, nvme, backend, host_ahci
-│   ├── tpm/           commands, crypto, ek_cert, sha256, state
-│   └── (root)         acpi_pm, kvmclock, fwcfg, i8042
-├── acpi/              RSDP/XSDT/FADT/MADT/HPET tables, acpi_fwcfg, aml
-├── clock/             clock (monotonic virtual TSC), host_tick, tsc_freq
-├── identity/          profile (→ veneer-profile re-export), profile_gen,
-│                      smbios, nvram_io, uefi_vars, active
-├── config/            mod (Config schema), toml (Config TOML dispatch)
-├── debug/             serial, serial_kd (WinDbg KD bridge), validator, report
-├── introspect/        VMI: translate, mem  (research)
-└── hook/              stealth exec-hook engine  (research)
+│
+│  Layers are grouped by architectural ROLE. Boundary rule per bucket below;
+│  the dependency graph is a DAG: infra ← {hypervisor → hardware, guest} ←
+│  {introspect, diag}. (Where a file goes: ask which one-line rule it matches.)
+│
+├── infra/             "shared low-level primitive used across layers"
+│   ├── arch.rs        raw x86-64: cpuid/rdmsr/wrmsr/in/out/cr/hlt (HAL)
+│   ├── clock/         monotonic virtual TSC, host_tick, tsc_freq
+│   ├── config/        Config schema + TOML dispatch
+│   └── serial.rs      COM1 log transport + sprint!/sprintln! macros
+├── hypervisor/        "runs/traps the guest (the VMM core)"
+│   ├── svm/           vmcb, vmrun, npt, msrpm, iopm, smp, vcpu_pool, gprs,
+│   │                  + arm_exec_trap (NX hook primitive)
+│   └── vmexit/        dispatch + handlers: decode, lengths, cpuid, msr, cr, dr,
+│                      dt, exception, hlt, rdtsc, vmmcall, stealth, io, npf
+├── hardware/          "virtual hardware/tables the guest perceives"
+│   ├── devices/       irq/{lapic,ioapic,pic,pit,hpet,rtc,inject},
+│   │                  bus/{pci,xhci,vga,nic}, storage/{ahci,nvme,backend,
+│   │                  host_ahci}, tpm/*, (root) acpi_pm,kvmclock,fwcfg,i8042
+│   ├── acpi/          RSDP/XSDT/FADT/MADT/HPET tables, acpi_fwcfg, aml
+│   └── identity/      profile, profile_gen, smbios, nvram_io, uefi_vars, active
+├── guest/             "loads/launches the guest, manages guest RAM"
+│   └── boot/          chain_load, esp_io, guest_blob, guest_mem, linux_loader,
+│                      menu, uefi_config
+├── introspect/        "observes/rewrites guest state from L1 (research/spoof)"
+│   ├── translate, mem VMI read/translate foundation
+│   └── hook/          stealth exec-hook engine (built on the VMI foundation)
+└── diag/              "developer diagnostics; removable without behavior change"
+                       serial_kd (WinDbg KD bridge), validator, report
 ```
 
 ---

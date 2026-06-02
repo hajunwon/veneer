@@ -4,7 +4,7 @@
 //! true physical bytes — under PatchGuard's checksums and under HVCI's
 //! VTL0/VTL1 split. This is the foundation every research primitive builds on.
 
-use crate::boot::guest_mem;
+use crate::guest::boot::guest_mem;
 
 use super::translate::gva_to_gpa;
 

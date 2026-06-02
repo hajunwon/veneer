@@ -4,7 +4,7 @@
 //! for any guest CR3 regardless of in-guest protections (PatchGuard / HVCI
 //! guard the guest's *view*, not the hypervisor's physical access).
 
-use crate::boot::guest_mem;
+use crate::guest::boot::guest_mem;
 
 const PFN_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 

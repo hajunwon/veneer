@@ -31,11 +31,14 @@ A Cargo workspace of three crates (split on the `no_std` / `std` axis):
 | `veneer-uefi` | no_std bin | the hypervisor (`.efi`, loaded by firmware) |
 | `host/veneer-probe` | std bin | host-side pre-flight: `inspect` / `plan` / `profile-check` |
 
-The hypervisor is organized into domain folders: `boot/ svm/ vmexit/
-devices/{irq,bus,storage,tpm} acpi/ clock/ identity/ config/ debug/ introspect/
-hook/`. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full map and design.
+The hypervisor is organized into role-based layers: `infra/` (arch, clock,
+config, serial) underpins `hypervisor/` (svm, vmexit), which drives `hardware/`
+(devices, acpi, identity); `guest/` (boot) loads the guest, and `introspect/`
+(VMI + hook) and `diag/` (KD bridge, validation) layer on top. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the full map, the per-layer boundary
+rule, and design.
 
-## Status (2026-06-02)
+## Status (2026-06-03)
 
 Boots OVMF firmware and runs Windows (tiny11) deep into kernel init. Working:
 AMD SVM bring-up, NPT, full intercept set, multi-vCPU; emulated LAPIC / IO-APIC /
@@ -43,8 +46,15 @@ PIC / PIT / HPET / RTC, PCI / NVMe / AHCI / xHCI / VGA / NIC, ACPI / SMBIOS /
 fw_cfg / TPM(CRB); profile-driven identity persisted in NVRAM; a VMI +
 stealth-hook research engine; a TPM 2.0 crypto foundation.
 
-**Blocked** on a `KxWaitForSpinLockAndAcquire` spinlock deadlock during Windows
-kernel init. Outstanding work: [TODO.md](TODO.md).
+The `KxWaitForSpinLockAndAcquire` spinlock deadlock during Windows kernel init is
+**root-caused** (KD callstack): the HAL's clock init holds a high-level spinlock
+while arming the HPET, and the clock interrupt veneer delivers re-enters the same
+lock on the lone boot CPU. The remaining gap is that the guest's IRQL is not
+exposed in any register veneer can observe at this phase, so it can't gate the
+interrupt — next is an in-hypervisor VMI probe of the guest's masking state.
+The host-side gating (VM work hanging the host) is resolved: vCPU affinity pin +
+headless boot + `mks.enable3d=FALSE` (a host NVIDIA-driver `0x3B` BSOD via
+VMware's 3D render path). Outstanding work: [TODO.md](TODO.md).
 
 Runs nested under VMware Workstation (AMD SVM, `vhv=true`) for development.
 

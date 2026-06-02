@@ -5,30 +5,27 @@
 // intentionally defined ahead of use. Genuine dead paths are removed, not allowed.
 #![allow(dead_code)]
 
-mod acpi;
-mod arch;
-mod clock;
-mod config;
-use crate::config::toml;
-mod devices;
-mod vmexit;
+mod infra;
+mod hypervisor;
+mod hardware;
+mod guest;
 #[allow(dead_code)]
 mod introspect;
-#[allow(dead_code)]
-mod hook;
-use crate::debug::report::{report_profile, report_ap_probe, verify, report_vmexit, report_success, report_error};
-mod debug;
-use crate::debug::{serial, validator};
-mod identity;
-use crate::identity::{profile, profile_gen, smbios, nvram_io, uefi_vars, active};
-use crate::clock::{host_tick, tsc_freq};
-use crate::acpi::acpi_fwcfg;
-mod boot;
-use crate::boot::{chain_load, esp_io, guest_blob, guest_mem, linux_loader, menu, uefi_config};
-mod svm;
-use crate::svm::{vmcb, vmrun, npt, smp, vcpu_pool, gprs};
+mod diag;
 
-use arch::halt_forever;
+use crate::infra::config::toml;
+use crate::infra::{arch, config};
+use crate::hypervisor::vmexit;
+use crate::hardware::{acpi, devices};
+use crate::infra::serial;
+use crate::infra::clock::{host_tick, tsc_freq};
+use crate::infra::arch::halt_forever;
+use crate::hypervisor::svm::{self, vmcb, vmrun, npt, smp, vcpu_pool, gprs};
+use crate::hardware::identity::{profile, profile_gen, smbios, nvram_io, uefi_vars, active};
+use crate::hardware::acpi::acpi_fwcfg;
+use crate::guest::boot::{chain_load, esp_io, guest_blob, guest_mem, linux_loader, menu, uefi_config};
+use crate::diag::report::{report_profile, report_ap_probe, verify, report_vmexit, report_success, report_error};
+use crate::diag::validator;
 use uefi::prelude::*;
 
 const BANNER: &str = concat!(
@@ -463,7 +460,7 @@ fn run_guest(
     );
     // Publish the NPT root so the stealth exec-hook engine can arm/dispatch.
     // (The build_translated paths need the same one call when exercised.)
-    crate::hook::set_npt(&npt_root);
+    crate::introspect::hook::set_npt(&npt_root);
 
     // Trap the Local APIC MMIO window so guest accesses route through
     // our emulator instead of touching the host LAPIC.
@@ -1302,7 +1299,7 @@ fn enter_ovmf_guest(
     // Bring up the COM2 <-> WinDbg kernel-debug bridge (no-op if no physical
     // COM2 / VMware serial1 pipe is attached). Lets a host WinDbg attach to the
     // guest's KD transport so an early-boot bugcheck/break is fully visible.
-    crate::debug::serial_kd::host_init();
+    crate::diag::serial_kd::host_init();
 
     // Arm the host preemption tick: a host LAPIC timer + INTR intercept forces
     // a periodic #VMEXIT even when the guest runs exit-free (native RDTSC), so
@@ -1364,7 +1361,7 @@ fn dump_host_apic_state() {
             rd(0x20), rd(0x30), rd(0xF0), rd(0x320), rd(0x380), rd(0x390), rd(0x3E0)
         );
     }
-    sprintln!("[hostapic] host_tsc_freq={} Hz", crate::clock::tsc_freq::host_tsc_freq());
+    sprintln!("[hostapic] host_tsc_freq={} Hz", crate::infra::clock::tsc_freq::host_tsc_freq());
 }
 
 
@@ -1401,7 +1398,7 @@ fn linux_vmrun_loop(vmcb_phys: u64, host_ext_save_pa: u64, vmcb_ptr: *mut vmcb::
     let (mut h_cpuid, mut h_msr, mut h_ioio, mut h_pmtmr, mut h_npf, mut h_hlt, mut h_other) =
         (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut h_rdtsc = 0u64;
-    let mut last_report_tsc = crate::clock::now();
+    let mut last_report_tsc = crate::infra::clock::now();
     // Track the heartbeat RIP across reports so a stall (RIP frozen in a small
     // region) is visible and we can dump the code there once.
     let mut last_hb_rip: u64 = 0;
@@ -1426,7 +1423,7 @@ fn linux_vmrun_loop(vmcb_phys: u64, host_ext_save_pa: u64, vmcb_ptr: *mut vmcb::
         }
         if iters.is_multiple_of(REPORT_EVERY) {
             let rip = unsafe { (*vmcb_ptr).state.rip };
-            let now = crate::clock::now();
+            let now = crate::infra::clock::now();
             let ms = now.wrapping_sub(last_report_tsc) / (tsc_freq::host_tsc_freq() / 1000).max(1);
             let rate = if ms > 0 { REPORT_EVERY * 1000 / ms } else { 0 };
             sprintln!("[linux-guest] still running: iter={} RIP=0x{:016X} vclk=0x{:X}", iters, rip, now);
@@ -1477,7 +1474,7 @@ fn linux_vmrun_loop(vmcb_phys: u64, host_ext_save_pa: u64, vmcb_ptr: *mut vmcb::
         // Pump the COM2 <-> WinDbg KD bridge often so the debugger handshake /
         // break-in stays responsive. Cheap when idle (a couple of port reads).
         if iters & 0xFF == 0 {
-            crate::debug::serial_kd::bridge();
+            crate::diag::serial_kd::bridge();
         }
         // Finer cadence than host-input polling: once RDTSC is native, VMEXITs
         // (and thus iterations) are sparse (~1 kHz), so a 0x3FF gate would only
@@ -1713,7 +1710,7 @@ unsafe fn guest_va_to_phys(_host_base: u64, cr3: u64, va: u64) -> Option<u64> {
     // NOT at host_base+phys (that read crashed veneer). guest_mem::to_host knows
     // both regions.
     let rd = |phys: u64| -> Option<u64> {
-        let h = crate::boot::guest_mem::to_host(phys)?;
+        let h = crate::guest::boot::guest_mem::to_host(phys)?;
         Some(unsafe { core::ptr::read_unaligned(h as *const u64) })
     };
     let shifts = [39u32, 30, 21, 12];
@@ -1741,7 +1738,7 @@ unsafe fn dump_kernel_stuck(host_base: u64, cr3: u64, rip: u64, rsp: u64) {
     // Read a 48-byte code window at a guest-PHYSICAL address through the proper
     // low/high host mapping (guest_mem::to_host) — never host_base+phys, which
     // is wrong for high RAM (>4 GiB) and crashed veneer with an OOB host read.
-    let dump_at = |gpa: u64, tag: &str| match crate::boot::guest_mem::to_host(gpa.saturating_sub(16)) {
+    let dump_at = |gpa: u64, tag: &str| match crate::guest::boot::guest_mem::to_host(gpa.saturating_sub(16)) {
         Some(h) => {
             let mut bytes = [0u8; 48];
             unsafe { core::ptr::copy_nonoverlapping(h as *const u8, bytes.as_mut_ptr(), 48) };
@@ -1763,7 +1760,7 @@ unsafe fn dump_kernel_stuck(host_base: u64, cr3: u64, rip: u64, rsp: u64) {
         sprintln!("[stuck] kernel RSP 0x{:X} did not translate", rsp);
         return;
     };
-    let Some(rsp_h) = crate::boot::guest_mem::to_host(rsp_phys) else {
+    let Some(rsp_h) = crate::guest::boot::guest_mem::to_host(rsp_phys) else {
         sprintln!("[stuck] kern rsp phys 0x{:X} not in guest RAM", rsp_phys);
         return;
     };

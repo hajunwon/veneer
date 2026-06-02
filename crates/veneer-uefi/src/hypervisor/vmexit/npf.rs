@@ -1,0 +1,261 @@
+//! Nested-page-fault (NPF) handler.
+//!
+//! Routes by faulting guest-physical address to one of the trapped MMIO
+//! regions (LAPIC / NIC BAR0 / NVMe BAR0). For each, we decode the
+//! faulting instruction via `decode::decode_mov`, recover the register
+//! operand + width + direction, then dispatch:
+//!
+//!   - **load (8B/8A)** — region.read(gpa, width) → guest register
+//!   - **store (89/88)** — guest register → region.write(gpa, val, width)
+//!
+//! `exit_info_1` carries page-fault flags (P/RW/US/RSVD/I-fetch/data,
+//! AMD APM Vol 2 §15.25.6) and `exit_info_2` holds the faulting GPA.
+//! We trust the opcode-derived direction rather than EXIT_INFO_1[RW] —
+//! the decoder is authoritative for which operand is memory.
+//!
+//! AMD NRIPS does *not* fill `next_rip` usefully for NPF — the field
+//! either equals the faulting RIP or is undefined — so we advance RIP
+//! by the decoded instruction length.
+
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use crate::hypervisor::svm::gprs::GuestGprs;
+use crate::sprintln;
+use crate::hypervisor::svm::vmcb::Vmcb;
+
+use crate::hardware::devices::storage::{ahci, nvme};
+use crate::hardware::devices::irq::{hpet, ioapic, lapic};
+use crate::hardware::devices::bus::{nic, vga, xhci};
+use crate::hardware::devices::tpm;
+use super::{decode, Action};
+
+// Rate-limit "unknown GPA" abort prints. A wild NPF storm during early
+// kernel boot can spam the serial log; cap to 16 first instances so
+// we still see which addresses are involved without drowning the trace.
+static UNKNOWN_NPF_COUNT: AtomicU64 = AtomicU64::new(0);
+const UNKNOWN_NPF_LOG_CAP: u64 = 64;
+
+// First-N NPF hits (any region) for boot diagnosis.
+static NPF_TOTAL_COUNT: AtomicU64 = AtomicU64::new(0);
+const NPF_TOTAL_LOG_CAP: u64 = 24;
+
+static NPF_DECODE_FAIL: AtomicU64 = AtomicU64::new(0);
+
+// Diagnostic (terminal-blocker hunt): the guest spins in OVMF firmware
+// (RIP 0x7Exxxxxx-0x7Fxxxxxx) busy-polling some MMIO register. Capture
+// which GPA/region it hammers so we can identify the register and why it
+// never satisfies. Throttled. Remove once the spin is understood.
+static SPIN_NPF_COUNT: AtomicU64 = AtomicU64::new(0);
+static SPIN_RD_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn region_name(gpa: u64) -> &'static str {
+    match TrapRegion::for_gpa(gpa) {
+        Some(TrapRegion::Lapic) => "lapic",
+        Some(TrapRegion::Nic) => "nic",
+        Some(TrapRegion::Nvme) => "nvme",
+        Some(TrapRegion::Hpet) => "hpet",
+        Some(TrapRegion::Tpm) => "tpm",
+        Some(TrapRegion::IoApic) => "ioapic",
+        Some(TrapRegion::Xhci) => "xhci",
+        Some(TrapRegion::Ahci) => "ahci",
+        Some(TrapRegion::Vga) => "vga",
+        Some(TrapRegion::Ecam) => "ecam",
+        None => "UNMAPPED",
+    }
+}
+
+pub unsafe fn handle(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
+    let c = unsafe { &(*vmcb).control };
+    let gpa   = { c.exit_info_2 };
+    let info1 = { c.exit_info_1 };
+    let rip   = unsafe { (*vmcb).state.rip };
+
+    // Stealth exec-hook: instruction-fetch fault on an armed hook page is
+    // captured + resumed here. No-op (falls through) when no hooks are armed.
+    if unsafe { crate::introspect::hook::dispatch(vmcb, gpa, info1, rip, gprs) } {
+        return Action::Resume;
+    }
+
+    // Spin diagnostic: firmware-region NPF poll. The offset within the
+    // region (gpa - region base) names the exact register being polled.
+    if (0x7E00_0000..0x8000_0000).contains(&rip) {
+        let n = SPIN_NPF_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 8 || n % 8192 == 0 {
+            // clk + floor: if clk barely moves between samples and floor=0, the
+            // virtual clock is crawling (b2 — SPIN_FLOOR not engaging on this
+            // multi-RIP NPF poll) so any OVMF timeout never counts down. If clk
+            // advances yet the spin persists, OVMF is waiting on an event/bit
+            // (b1 / A), not a clock timeout.
+            let clk = crate::infra::clock::now();
+            let floor = crate::infra::clock::spin_floor();
+            sprintln!("[npf-spin] GPA=0x{:08X} region={} info1=0x{:X} rip=0x{:X} clk=0x{:X} floor=0x{:X} #{}",
+                gpa, region_name(gpa), info1, rip, clk, floor, n);
+        }
+    }
+
+    let total = NPF_TOTAL_COUNT.fetch_add(1, Ordering::Relaxed);
+    if total < NPF_TOTAL_LOG_CAP {
+        sprintln!("[npf] GPA=0x{:016X} info1=0x{:X} RIP=0x{:016X} (#{}/{})",
+            gpa, info1, rip, total + 1, NPF_TOTAL_LOG_CAP);
+    }
+
+    let region = match TrapRegion::for_gpa(gpa) {
+        Some(r) => Some(r),
+        None => {
+            // Standard hypervisor pattern (KVM `vmx_handle_ept_misconfig`,
+            // QEMU `kvm_set_phys_mem`): an MMIO read at an address with
+            // no backing device returns all-zeros, a write is silently
+            // dropped, and the guest moves on. Real PC firmware does
+            // the same with the legacy ISA "no device responds" bus
+            // pull-up — drivers see 0xFF for IO ports / 0 for MMIO and
+            // bail their probe routines.
+            //
+            // Aborting on every unknown MMIO would break legitimate
+            // driver probes for chipset blocks we haven't modeled
+            // (AMD IOMMU at 0xFED80000, motherboard SMBus, etc.). Log
+            // the first NN_LOG_CAP hits so a real bug is still visible
+            // in the trace.
+            let n = UNKNOWN_NPF_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < UNKNOWN_NPF_LOG_CAP {
+                sprintln!(
+                    "[npf ] unknown GPA=0x{:016X} info1=0x{:X} RIP=0x{:016X} (#{}/{}) -> silent",
+                    gpa, info1, rip, n + 1, UNKNOWN_NPF_LOG_CAP,
+                );
+            }
+            None
+        }
+    };
+
+    let fetched = c.guest_inst_len as usize;
+    let bytes = unsafe { &(*vmcb).control.guest_inst_bytes };
+    let valid = &bytes[..fetched.min(bytes.len())];
+    let decoded = match decode::decode_mov(valid) {
+        Some(d) if d.len > 0 => d,
+        _ => {
+            let n = NPF_DECODE_FAIL.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                let b = valid;
+                sprintln!(
+                    "[npf] DECODE FAIL gpa=0x{:X} info1=0x{:X} rip=0x{:X} ilen={} bytes={:02X?}",
+                    gpa, info1, rip, fetched, b
+                );
+            }
+            return Action::Abort;
+        }
+    };
+
+    let s = unsafe { &mut (*vmcb).state };
+
+    if decoded.is_write {
+        // Store value comes from the immediate (C6/C7) when present,
+        // otherwise from the register operand.
+        let val = match decoded.imm {
+            Some(imm) => imm,
+            None => gprs.read_indexed(s, decoded.reg),
+        };
+        if let Some(ref r) = region {
+            r.write(gpa, val, decoded.mem_width);
+        }
+        // None: unknown MMIO write — silently drop, KVM-style.
+    } else {
+        let raw = match region {
+            Some(ref r) => r.read(gpa, decoded.mem_width),
+            // Unknown MMIO read returns 0 (KVM `vmx_handle_ept_misconfig`
+            // fallback). Real chipsets behave the same for unmapped
+            // bus addresses.
+            None => 0,
+        };
+        // Spin diagnostic: the polled value reveals which bit OVMF waits for.
+        // Log a CONTIGUOUS window (#40000..40140) to capture the exact
+        // register read sequence of one poll-loop iteration.
+        if (0x7E00_0000..0x8000_0000).contains(&rip) {
+            let n = SPIN_RD_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 8 || (40000..40140).contains(&n) || n % 8192 == 0 {
+                sprintln!("[npf-rd] {} gpa=0x{:08X} = 0x{:X} w{} rip=0x{:X} #{}",
+                    region_name(gpa), gpa, raw, decoded.mem_width, rip, n);
+            }
+        }
+        // Extend the narrow memory operand into the destination register.
+        // MOVSX sign-extends; plain MOV / MOVZX zero-extend (which is what
+        // write_indexed_width does at reg_width). reg_width == mem_width for
+        // the plain MOVs, so the extension is a no-op there.
+        let val = if decoded.signed {
+            sign_extend(raw, decoded.mem_width)
+        } else {
+            raw
+        };
+        gprs.write_indexed_width(s, decoded.reg, val, decoded.reg_width);
+    }
+
+    s.rip = s.rip.wrapping_add(decoded.len);
+    Action::Resume
+}
+
+/// Sign-extend a `width`-byte value held in the low bits of `val` to 64 bits.
+fn sign_extend(val: u64, width: u8) -> u64 {
+    match width {
+        1 => (val as u8 as i8 as i64) as u64,
+        2 => (val as u16 as i16 as i64) as u64,
+        4 => (val as u32 as i32 as i64) as u64,
+        _ => val,
+    }
+}
+
+enum TrapRegion {
+    Lapic,
+    Nic,
+    Nvme,
+    Hpet,
+    Tpm,
+    IoApic,
+    Xhci,
+    Ahci,
+    Vga,
+    Ecam,
+}
+
+impl TrapRegion {
+    fn for_gpa(gpa: u64) -> Option<Self> {
+        if lapic::covers(gpa) { return Some(Self::Lapic); }
+        if nic::covers(gpa) { return Some(Self::Nic); }
+        if nvme::covers(gpa) { return Some(Self::Nvme); }
+        if hpet::covers(gpa) { return Some(Self::Hpet); }
+        if tpm::covers(gpa) { return Some(Self::Tpm); }
+        if ioapic::covers(gpa) { return Some(Self::IoApic); }
+        if xhci::covers(gpa) { return Some(Self::Xhci); }
+        if ahci::covers(gpa) { return Some(Self::Ahci); }
+        if vga::mmio_covers(gpa) { return Some(Self::Vga); }
+        if crate::hardware::devices::bus::pci::covers_ecam(gpa) { return Some(Self::Ecam); }
+        None
+    }
+
+    fn read(&self, gpa: u64, width: u8) -> u64 {
+        match self {
+            Self::Lapic  => lapic::read_register_width((gpa - lapic::LAPIC_BASE) as u32, width),
+            Self::Nic    => nic::read_register_width((gpa - nic::base()) as u32, width),
+            Self::Nvme   => nvme::read_register_width((gpa - nvme::bar0_base()) as u32, width),
+            Self::Hpet   => hpet::read_register_width((gpa - hpet::HPET_BASE) as u32, width),
+            Self::Tpm    => tpm::read_register_width((gpa - tpm::TPM_BASE) as u32, width),
+            Self::IoApic => ioapic::read_register_width((gpa - ioapic::IOAPIC_BASE) as u32, width),
+            Self::Xhci   => xhci::read_register_width((gpa - xhci::base()) as u32, width),
+            Self::Ahci   => ahci::read_register_width((gpa - ahci::base()) as u32, width),
+            Self::Vga    => vga::mmio_read(gpa, width),
+            Self::Ecam   => crate::hardware::devices::bus::pci::ecam_read(gpa, width),
+        }
+    }
+
+    fn write(&self, gpa: u64, val: u64, width: u8) {
+        match self {
+            Self::Lapic  => lapic::write_register_width((gpa - lapic::LAPIC_BASE) as u32, val, width),
+            Self::Nic    => nic::write_register_width((gpa - nic::base()) as u32, val, width),
+            Self::Nvme   => nvme::write_register_width((gpa - nvme::bar0_base()) as u32, val, width),
+            Self::Hpet   => hpet::write_register_width((gpa - hpet::HPET_BASE) as u32, val, width),
+            Self::Tpm    => tpm::write_register_width((gpa - tpm::TPM_BASE) as u32, val, width),
+            Self::IoApic => ioapic::write_register_width((gpa - ioapic::IOAPIC_BASE) as u32, val, width),
+            Self::Xhci   => xhci::write_register_width((gpa - xhci::base()) as u32, val, width),
+            Self::Ahci   => ahci::write_register_width((gpa - ahci::base()) as u32, val, width),
+            Self::Vga    => vga::mmio_write(gpa, val, width),
+            Self::Ecam   => crate::hardware::devices::bus::pci::ecam_write(gpa, val, width),
+        }
+    }
+}

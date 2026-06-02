@@ -8,5 +8,6 @@
 
 pub mod translate;
 pub mod mem;
+pub mod hook;
 
 pub use mem::read_phys;
