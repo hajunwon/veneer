@@ -95,9 +95,8 @@ fn rdtsc_raw() -> u64 {
     unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags)); }
     ((hi as u64) << 32) | (lo as u64)
 }
-const SPIN_THRESHOLD: u32 = 16;
-/// Far above SPIN_THRESHOLD (the convergence-floor trigger): a same-RIP run
-/// this long is a wedge (deadlock), not a delay loop. Fires one diag snapshot.
+/// A same-RIP run this long is a wedge (deadlock), not a delay loop — delay
+/// loops now converge on real time via the host tick. Fires one diag snapshot.
 const DIAG_SPIN_THRESHOLD: u32 = 20_000;
 const DIAG_DUMP_CAP: u32 = 3;
 static DIAG_LAST_PAGE: AtomicU64 = AtomicU64::new(0);
@@ -131,13 +130,15 @@ pub enum Action {
 pub unsafe fn dispatch(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
     let rip = unsafe { (*vmcb).state.rip };
     let code = unsafe { (*vmcb).control.exit_code };
+    // Re-anchor the clock to the host HPET on each preemption tick. Reading
+    // the host HPET is a VMware exit, so it's done here at tick rate (~200 Hz)
+    // rather than per now() call.
+    if code == exit_code::INTR && crate::infra::clock::host_tick::armed() {
+        crate::infra::clock::discipline();
+    }
     // The host preemption tick (physical INTR, ~200 Hz) fires at an arbitrary
-    // guest RIP. If it drives the spin detector it resets the same-RIP run
-    // every ~5 ms, so a guest in a PM-timer / RDTSC busy-wait (e.g.
-    // nt!HalpTimerStallExecutionProcessor) never reaches SPIN_THRESHOLD and the
-    // convergence floor never engages — the delay then crawls on the host TSC
-    // VMware throttles during the spin. Skip the detector on INTR: preserve
-    // SPIN_RIP/COUNT and the active floor across the tick.
+    // guest RIP. Skip it in the wedge detector so it doesn't reset the
+    // same-RIP run every ~5 ms and mask a real deadlock.
     if code != exit_code::INTR {
         let count = if SPIN_RIP.swap(rip, Ordering::Relaxed) == rip {
             SPIN_COUNT.fetch_add(1, Ordering::Relaxed) + 1
@@ -145,15 +146,6 @@ pub unsafe fn dispatch(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
             SPIN_COUNT.store(0, Ordering::Relaxed);
             0
         };
-        // ~1 µs of calibrated TSC per spin iteration: enough to converge a
-        // multi-million-iteration delay in real-time-proportional steps without
-        // over-advancing the guest clock.
-        let floor = if count >= SPIN_THRESHOLD {
-            (crate::infra::clock::tsc_freq::host_tsc_freq() / 1_000_000).max(1)
-        } else {
-            0
-        };
-        crate::infra::clock::set_spin_floor(floor);
         // Sustained same-RIP spin far past the floor threshold = a real wedge.
         // Fire once per distinct stall page (cap a few) so a transient earlier
         // spin AND the terminal wedge are both captured if they differ.

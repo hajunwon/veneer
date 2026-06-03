@@ -656,6 +656,9 @@ fn enter_linux_guest(
         svm_mode_freq / 1_000_000,
         (svm_mode_freq / 1_000) % 1000,
     );
+    // Anchor the faithful clock to the host HPET (a wall-clock-reliable
+    // counter here) using the just-measured host TSC frequency.
+    crate::infra::clock::init_hpet_clock(svm_mode_freq);
 
     // Diagnostic: report whether the host CPU exposes the AMD SVM
     // TscRateMsr feature (CPUID 0x8000_000A.EDX bit 4). When 1, the
@@ -1037,6 +1040,9 @@ fn enter_ovmf_guest(
     let svm_mode_freq = tsc_freq::calibrate_via_rtc_uip();
     tsc_freq::store_host_tsc_freq(svm_mode_freq);
     sprintln!("[ovmf-guest] SVM-mode TSC: {} Hz", svm_mode_freq);
+    // Anchor the faithful clock to the host HPET (a wall-clock-reliable
+    // counter here) using the just-measured host TSC frequency.
+    crate::infra::clock::init_hpet_clock(svm_mode_freq);
 
     // 1. Read OVMF CODE + VARS from our ESP.
     let our_image = uefi::boot::image_handle();

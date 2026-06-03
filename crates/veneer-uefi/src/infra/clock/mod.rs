@@ -1,91 +1,77 @@
-//! Monotonic virtual TSC.
+//! Faithful invariant guest clock, disciplined to the host HPET.
 //!
-//! Under VMware nested SVM the host TSC veneer reads can take a one-time
-//! step: observed as a single ~2.5e14-cycle forward jump when VMware
-//! switches the L1 from a boot-relative TSC to host-TSC passthrough mid
-//! boot. Timers scaled straight off raw RDTSC then wrap thousands of
-//! times at the jump and strand firmware delay loops (OVMF's
-//! `InternalAcpiDelay` never reaches its latched deadline).
+//! The guest TSC, the HPET main counter, the ACPI PM timer and the LAPIC
+//! timer are all built on `now()`. For an OS to trust the TSC (and pick the
+//! LAPIC TSC-deadline timer over a per-tick HPET MMIO read), `now()` must
+//! behave like a real invariant TSC: monotonic, constant real rate.
 //!
-//! `now()` filters the step: a real per-call delta within a plausible
-//! bound advances the virtual clock by that delta; an absurd-forward or
-//! backward delta advances by a small nominal tick instead. The result
-//! is monotonic and tracks real wall rate on both sides of the
-//! discontinuity, so every timer built on it (`now()` units == host TSC
-//! cycles) is immune to the jump.
+//! Under VMware nested SVM the host TSC is not a reliable wall clock on its
+//! own — it steps once mid boot and is throttled during guest busy-spins, so
+//! a passthrough crawls and a per-call floor (an earlier design) makes the
+//! rate depend on how often veneer is entered, which an OS rejects. But the
+//! host HPET *does* keep wall-clock semantics here (measured at 99% of its
+//! advertised 14.318 MHz over an RTC second), so it is the real-time anchor.
+//!
+//!   now() = ANCHOR_REALTIME + (rdtsc() - ANCHOR_TSC)
+//!
+//! Each host preemption tick (~200 Hz) reads the host HPET and re-anchors
+//! ANCHOR_REALTIME to true real time (converted to TSC cycles) and ANCHOR_TSC
+//! to the raw TSC. Between ticks the raw TSC interpolates for fine resolution;
+//! a throttle merely makes the interpolation lag until the next tick snaps it
+//! back to real time — accurately, with no accumulated error, so the clock
+//! never runs fast (which would storm an OS's TSC-deadline timers). The
+//! one-time TSC step is folded into ANCHOR_TSC so it never reaches `now`.
 
 pub mod host_tick;
 pub mod tsc_freq;
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// A delta larger than this between consecutive reads is a discontinuity,
-/// not elapsed time (~0.1 s at 3 GHz; real spacing is microseconds).
-const MAX_PLAUSIBLE_DELTA: u64 = 300_000_000;
-/// Advance substituted for a filtered step — non-zero so the clock keeps
-/// moving, small enough to be negligible against real deltas.
-const NOMINAL_DELTA: u64 = 1_000;
+/// Host HPET MMIO base (fixed by the PC platform). GEN_CAP at +0x00
+/// (bits 63:32 = period in fs), GEN_CONFIG at +0x10 (bit 0 = enable),
+/// main counter at +0xF0.
+const HOST_HPET: usize = 0xFED0_0000;
 
-static LAST_REAL: AtomicU64 = AtomicU64::new(0);
-static VIRTUAL: AtomicU64 = AtomicU64::new(0);
+#[inline]
+fn host_hpet_counter() -> u64 {
+    unsafe { read_volatile((HOST_HPET + 0xF0) as *const u64) }
+}
 
-/// A forward delta this large between two clock reads is VMware's one-time
-/// host-TSC step, not elapsed time (~333 s @3 GHz — far beyond any real idle
-/// gap, far below the ~7e14-cycle step we actually observe).
+// ── Real-time anchor (disciplined to the host HPET) ──────────────────
+static ENABLED: AtomicBool = AtomicBool::new(false);
+static HPET_HZ: AtomicU64 = AtomicU64::new(0);
+static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+static HPET_BASE: AtomicU64 = AtomicU64::new(0);
+static TSC_BASE: AtomicU64 = AtomicU64::new(0);
+static ANCHOR_REALTIME: AtomicU64 = AtomicU64::new(0);
+static ANCHOR_TSC: AtomicU64 = AtomicU64::new(0);
+static LAST_NOW: AtomicU64 = AtomicU64::new(0);
+
+// ── VMware one-time host-TSC step detection ──────────────────────────
+/// A forward raw-RDTSC delta this large is VMware's step, not elapsed time.
 const STEP_THRESHOLD: u64 = 1_000_000_000_000;
-/// Set once a VMware TSC step has been observed. VMware steps MORE THAN ONCE
-/// (clustered around mid-boot), so we don't go native on the first one —
-/// switching too early lets a later step hit the native phase and corrupt a
-/// guest timed-wait (e.g. cdboot's "press any key" countdown).
-static STEP_SEEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// now()-call counter and the count at the most recent step. We only declare
-/// the steps "settled" after a sustained stable stretch with no new step.
+static LAST_RAW: AtomicU64 = AtomicU64::new(0);
+static STEP_SEEN: AtomicBool = AtomicBool::new(false);
 static CALL_COUNT: AtomicU64 = AtomicU64::new(0);
 static LAST_STEP_CALL: AtomicU64 = AtomicU64::new(0);
-/// Total VMware TSC steps observed so far (diagnostic + native-switch log).
 static STEP_COUNT: AtomicU64 = AtomicU64::new(0);
-/// Stable now()-calls required after the last step before going native.
-/// A LATE step (after we've gone native) is no longer fatal: the dispatcher
-/// reconciles every exit and RE-INTERCEPTS RDTSC on any fresh step (see
-/// `vmexit::dispatch`), so this no longer has to be large enough to outlast
-/// the entire cluster — it only has to outlast the gap *between* two steps in
-/// the cluster, so the brief native windows mid-cluster don't expose a guest
-/// timed-wait. Provisional: tune from the `[clock] TSC step` gap log.
+/// Stable now()-calls after the last step before the guest's RDTSC may go
+/// native (so a clustered late step doesn't hit the native window).
 const STABLE_CALLS: u64 = 50_000;
 
-/// Number of VMware host-TSC steps observed so far. Used by the dispatcher's
-/// native-switch log; also a coarse boot-phase signal.
+/// Number of VMware host-TSC steps observed so far.
 pub fn steps_seen() -> u64 {
     STEP_COUNT.load(Ordering::Relaxed)
 }
 
-/// True once the VMware host-TSC step CLUSTER has passed and the clock has
-/// been stable since. Until then RDTSC stays intercepted (filtered) so the
-/// guest never sees a jump; the slow intercepted window is only the pre-stable
-/// boot phase (no tight RDTSC delay loops there). After this the guest reads
-/// RDTSC natively with the offset carrying the smooth clock.
+/// True once the VMware host-TSC step cluster has passed and the clock has
+/// been stable since — the dispatcher then lets the guest read RDTSC
+/// natively. A fresh step flips it back (handled in the dispatcher).
 pub fn step_absorbed() -> bool {
     STEP_SEEN.load(Ordering::Relaxed)
         && CALL_COUNT.load(Ordering::Relaxed).wrapping_sub(LAST_STEP_CALL.load(Ordering::Relaxed))
             > STABLE_CALLS
-}
-
-/// Per-call minimum advance, set by the dispatcher's tight-spin detector.
-/// Non-zero while the guest is hammering one RIP (a TSC / PM-timer delay
-/// loop), so any clock read in that handler — RDTSC, ACPI PM timer, HPET —
-/// floors its advance and the delay converges instead of crawling on the
-/// host TSC VMware throttles during busy spins.
-static SPIN_FLOOR: AtomicU64 = AtomicU64::new(0);
-
-/// Set the tight-spin advance floor (0 = not spinning). Called once per
-/// VMEXIT by the dispatcher.
-pub fn set_spin_floor(floor: u64) {
-    SPIN_FLOOR.store(floor, Ordering::Relaxed);
-}
-
-/// Diagnostic: current tight-spin advance floor (0 = detector not engaged).
-pub fn spin_floor() -> u64 {
-    SPIN_FLOOR.load(Ordering::Relaxed)
 }
 
 #[inline]
@@ -96,60 +82,85 @@ fn rdtsc() -> u64 {
     ((hi as u64) << 32) | (lo as u64)
 }
 
-/// Monotonic virtual TSC in host-TSC cycle units, immune to one-time
-/// host-TSC steps. The CAS on `LAST_REAL` serialises the advance so the
-/// `VIRTUAL` fetch_add can't double-count under concurrent callers.
-pub fn now() -> u64 {
-    now_min(SPIN_FLOOR.load(Ordering::Relaxed))
+/// Anchor the clock to the host HPET. `tsc_hz` is the RTC-calibrated host
+/// TSC frequency. Reads the HPET advertised period for its own frequency,
+/// enables its counter, and snapshots both counters as the origin so `now`
+/// starts continuous with the raw TSC. Called once before the VMRUN loop.
+pub fn init_hpet_clock(tsc_hz: u64) {
+    let cap = unsafe { read_volatile(HOST_HPET as *const u64) };
+    let period_fs = (cap >> 32) & 0xFFFF_FFFF;
+    if cap == 0 || cap == u64::MAX || period_fs == 0 || period_fs > 100_000_000 {
+        crate::sprintln!("[clock] no host HPET (cap=0x{:016X}); falling back to raw TSC", cap);
+        return;
+    }
+    let hpet_hz = 1_000_000_000_000_000u64 / period_fs;
+    // Enable the main counter (GEN_CONFIG bit 0).
+    let cfg = unsafe { read_volatile((HOST_HPET + 0x10) as *const u64) };
+    unsafe { write_volatile((HOST_HPET + 0x10) as *mut u64, cfg | 1) };
+
+    let raw = rdtsc();
+    HPET_HZ.store(hpet_hz, Ordering::Relaxed);
+    TSC_HZ.store(tsc_hz.max(1), Ordering::Relaxed);
+    HPET_BASE.store(host_hpet_counter(), Ordering::Relaxed);
+    TSC_BASE.store(raw, Ordering::Relaxed);
+    ANCHOR_REALTIME.store(raw, Ordering::Relaxed);
+    ANCHOR_TSC.store(raw, Ordering::Relaxed);
+    LAST_NOW.store(raw, Ordering::Relaxed);
+    LAST_RAW.store(raw, Ordering::Relaxed);
+    ENABLED.store(true, Ordering::Relaxed);
+    crate::sprintln!("[clock] HPET-disciplined: hpet={} Hz tsc={} Hz base_tsc=0x{:X}", hpet_hz, tsc_hz, raw);
 }
 
-/// Like [`now`], but guarantees the clock advances by at least `floor`
-/// cycles on this call. The RDTSC handler uses this during a detected tight
-/// TSC delay-spin: VMware throttles the host TSC while our VM is busy, so the
-/// real per-call delta collapses to a few cycles and a deadline that should
-/// take 0.1 s would take hundreds of seconds. Flooring the advance lets the
-/// spin converge at roughly the calibrated rate. `floor = 0` is plain `now`.
-pub fn now_min(floor: u64) -> u64 {
-    let real = rdtsc();
-    let cc = CALL_COUNT.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-    loop {
-        let last = LAST_REAL.load(Ordering::Relaxed);
-        let real_adv = if last == 0 {
-            0
-        } else if real > last && real - last <= MAX_PLAUSIBLE_DELTA {
-            real - last
-        } else {
-            // Implausible forward delta. A GIANT one (≫ any real idle gap) is
-            // VMware's one-time nested-SVM host-TSC step (~7e14 cycles). Flag
-            // it so the dispatcher can switch the guest's RDTSC from the
-            // (slow, intercepted) filtered path to NATIVE once the step is
-            // safely behind us. A normal long idle gap stays well under this.
-            if last != 0 && real > last && real - last > STEP_THRESHOLD {
-                let prev_step_call = LAST_STEP_CALL.swap(cc, Ordering::Relaxed); // reset the stable window
-                STEP_SEEN.store(true, Ordering::Relaxed);
-                let n = STEP_COUNT.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-                // Diagnostic: when each step lands (call index), how far it is
-                // from the previous step (calls), and its magnitude. The
-                // gap_from_prev values across the cluster are exactly what
-                // STABLE_CALLS must exceed; the last step's call index tells us
-                // when the cluster ends relative to the heavy delay loops.
-                crate::sprintln!(
-                    "[clock] TSC step #{}: call={} gap_from_prev={} raw_delta=0x{:X} virt=0x{:X}",
-                    n,
-                    cc,
-                    cc.wrapping_sub(prev_step_call),
-                    real - last,
-                    VIRTUAL.load(Ordering::Relaxed)
-                );
-            }
-            NOMINAL_DELTA
-        };
-        let advance = real_adv.max(floor);
-        if LAST_REAL
-            .compare_exchange(last, real, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return VIRTUAL.fetch_add(advance, Ordering::Relaxed).wrapping_add(advance);
-        }
+/// True elapsed real time since the anchor origin, in host-TSC cycle units,
+/// from the throttle-immune host HPET.
+#[inline]
+fn realtime_from_hpet() -> u64 {
+    let hpet_delta = host_hpet_counter().wrapping_sub(HPET_BASE.load(Ordering::Relaxed));
+    let tsc_hz = TSC_HZ.load(Ordering::Relaxed) as u128;
+    let hpet_hz = HPET_HZ.load(Ordering::Relaxed).max(1) as u128;
+    let cycles = (hpet_delta as u128 * tsc_hz / hpet_hz) as u64;
+    TSC_BASE.load(Ordering::Relaxed).wrapping_add(cycles)
+}
+
+/// Re-anchor `now()` to the host HPET's real time. Called by the dispatcher
+/// on every #VMEXIT(INTR) (the ~200 Hz host preemption tick). Reading the
+/// host HPET is a VMware exit, so it is done here at tick rate, not per
+/// `now()` call. Snapping to the exact real time each tick corrects any
+/// throttle accumulated since the last one — without ever overshooting, so
+/// the clock can't run fast.
+pub fn discipline() {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
     }
+    ANCHOR_REALTIME.store(realtime_from_hpet(), Ordering::Relaxed);
+    ANCHOR_TSC.store(rdtsc(), Ordering::Relaxed);
+}
+
+/// Monotonic, constant-real-rate virtual TSC in host-TSC cycle units.
+pub fn now() -> u64 {
+    let raw = rdtsc();
+    let cc = CALL_COUNT.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    // VMware's one-time host-TSC step: fold it into ANCHOR_TSC so the
+    // interpolation below stays continuous, and flag it for the RDTSC
+    // native/intercept oracle.
+    let last = LAST_RAW.swap(raw, Ordering::Relaxed);
+    if last != 0 && raw > last && raw - last > STEP_THRESHOLD {
+        ANCHOR_TSC.fetch_add(raw - last, Ordering::Relaxed);
+        LAST_STEP_CALL.store(cc, Ordering::Relaxed);
+        STEP_SEEN.store(true, Ordering::Relaxed);
+        let n = STEP_COUNT.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        crate::sprintln!("[clock] TSC step #{}: call={} raw_delta=0x{:X}", n, cc, raw - last);
+    }
+    if !ENABLED.load(Ordering::Relaxed) {
+        return raw; // pre-anchor: raw TSC (the anchor starts here)
+    }
+    // Real time at the last tick + raw-TSC interpolation since.
+    let interp = raw.wrapping_sub(ANCHOR_TSC.load(Ordering::Relaxed));
+    let v = ANCHOR_REALTIME.load(Ordering::Relaxed).wrapping_add(interp);
+    // Monotonic backstop: a re-anchor that lands just below the interpolated
+    // value (or a step race) must never move `now` backward.
+    let last_now = LAST_NOW.load(Ordering::Relaxed);
+    let v = if v.wrapping_sub(last_now) as i64 > 0 { v } else { last_now };
+    LAST_NOW.store(v, Ordering::Relaxed);
+    v
 }

@@ -81,15 +81,11 @@ pub unsafe fn handle(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
     if (0x7E00_0000..0x8000_0000).contains(&rip) {
         let n = SPIN_NPF_COUNT.fetch_add(1, Ordering::Relaxed);
         if n < 8 || n % 8192 == 0 {
-            // clk + floor: if clk barely moves between samples and floor=0, the
-            // virtual clock is crawling (b2 — SPIN_FLOOR not engaging on this
-            // multi-RIP NPF poll) so any OVMF timeout never counts down. If clk
-            // advances yet the spin persists, OVMF is waiting on an event/bit
-            // (b1 / A), not a clock timeout.
+            // If clk advances between samples yet the spin persists, the guest
+            // is waiting on an event/bit, not a clock timeout.
             let clk = crate::infra::clock::now();
-            let floor = crate::infra::clock::spin_floor();
-            sprintln!("[npf-spin] GPA=0x{:08X} region={} info1=0x{:X} rip=0x{:X} clk=0x{:X} floor=0x{:X} #{}",
-                gpa, region_name(gpa), info1, rip, clk, floor, n);
+            sprintln!("[npf-spin] GPA=0x{:08X} region={} info1=0x{:X} rip=0x{:X} clk=0x{:X} #{}",
+                gpa, region_name(gpa), info1, rip, clk, n);
         }
     }
 
