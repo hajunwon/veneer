@@ -268,15 +268,15 @@ Std binary run on the real host (not a runtime layer):
 
 ---
 
-## 12. Current state (2026-06-03)
+## 12. Performance note — nested-virt VMEXIT cost
 
-Boots OVMF firmware and runs Windows (tiny11) into kernel init. The active
-focus is **boot time** under VMware nested SVM, where every #VMEXIT costs
-~155 µs so any MMIO-poll storm dominates. The HPET clock-arm NPF storm is fixed
-with a writable-shadow MMIO page (§5/§6); QPC runs on RDTSC (invariant-TSC +
-TSC-deadline advertised). The prior `KxWaitForSpinLockAndAcquire` kernel-init
-deadlock is no longer hit (boot progresses past it). Remaining boot-time cost:
-an early LAPIC xAPIC MMIO storm before the guest enables x2APIC ([TODO.md](TODO.md)
-§0). Runs nested under VMware Workstation (AMD SVM, `vhv=true`); host
-hard-freeze during nested-virt work is mitigated (vCPU affinity pin + headless +
-`mks.enable3d=FALSE`).
+Under VMware nested SVM every guest #VMEXIT costs on the order of 100–200 µs
+(L0 handles it before veneer does), so an MMIO-poll storm dominates boot time.
+This is why the HPET clock timer is backed by a writable-shadow MMIO page
+(§5/§6) rather than trapped — its per-tick `HalpHpetArmTimer` re-arm would
+otherwise be ~7 NPF #VMEXITs every couple of ms. The same pressure shapes the
+rest of the design: prefer native RDTSC (invariant-TSC + TSC-deadline
+advertised) over trapped timer MMIO, and reserve trapping for genuinely
+side-effecting registers.
+
+Build / boot / VM setup is in [SETUP.md](SETUP.md); open work in [TODO.md](TODO.md).

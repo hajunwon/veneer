@@ -23,27 +23,17 @@ in-guest defenses (PatchGuard, HVCI) to study `vgk` / `vgc` and feed `fake_vgc`.
 +--------------------------------------------------+
 ```
 
-## Build
+## Build & run
 
 ```bash
 cd crates/veneer-uefi && cargo build --release   # → target/x86_64-unknown-uefi/release/veneer-uefi.efi
 python tools/make_disk.py                         # from repo root: build the bootable ESP disk
 ```
 
-Host pre-flight tool (a separate `std` crate):
-
-```bash
-cd crates/host/veneer-probe && cargo build
-veneer inspect                        # probe host CPU capability (SVM/VMX, NPT, MSRs)
-veneer plan                           # which backend is viable + per-guest memory needs
-veneer profile-check <profile.toml>   # validate a profile against the schema
-```
-
-## Boot
-
-`make_disk.py` places `veneer-uefi.efi` at `\EFI\BOOT\BOOTX64.EFI` on the ESP;
-firmware runs it, veneer enables AMD SVM and chain-loads the guest (OVMF → the
-OS). Swap in `assets/shellx64.efi` to drop to a UEFI shell for diagnosis.
+veneer boots as a UEFI app: firmware runs `\EFI\BOOT\BOOTX64.EFI`, veneer
+enables AMD SVM and chain-loads the guest. Producing the disk, configuring the
+VMware VM (the required `.vmx` settings), and the development boot loop are in
+**[SETUP.md](SETUP.md)**.
 
 ## Architecture
 
