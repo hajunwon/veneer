@@ -119,13 +119,41 @@ fn tx_pop() -> Option<u8> {
 /// Flip to true only when actually attaching WinDbg to the COM2 pipe.
 const KD_ENABLED: bool = false;
 
+/// Always own the COM2 register range so io.rs never falls back to the
+/// `SYNTH_IO_DWORD` (0xFFFFFFFF) default for it. Returning 0xFF for the LSR
+/// sets the DR (data-ready) bit forever, which makes the guest's KDCOM
+/// `KdReceivePacket` read phantom 0xFF bytes in a tight spin (a boot wedge —
+/// observed once the HPET storm was removed and the boot raced to KD init).
+/// When KD is off we model a quiescent idle 16550 (DR clear) instead; when on,
+/// the bridged transport below takes over.
 #[inline]
 pub fn covers(port: u16) -> bool {
-    KD_ENABLED && PRESENT.load(Ordering::Relaxed) && port >= COM2 && port <= END
+    port >= COM2 && port <= END
 }
 
 /// Guest read of a COM2 register (IOIO #VMEXIT path).
 pub fn read(off: u16) -> u64 {
+    // KD off: present a quiescent idle 16550 (a real COM2 header with nothing
+    // on the wire). No physical-port access — routing to the live bridge with
+    // no WinDbg attached risks the physical LSR reading 0xFF (pipe drained/
+    // disconnected) and re-injecting the phantom-DR spin. DR clear, transmitter
+    // always ready, registers round-trip so a UART presence probe still passes.
+    if !KD_ENABLED {
+        return match off {
+            R_RBR_THR => if dlab() { DLL.load(Ordering::Relaxed) as u64 } else { 0 },
+            R_IER_DLM => if dlab() { DLM.load(Ordering::Relaxed) as u64 } else { IER.load(Ordering::Relaxed) as u64 },
+            R_IIR_FCR => {
+                let fifo = if FCR.load(Ordering::Relaxed) & 1 != 0 { 0xC0 } else { 0x00 };
+                (fifo | 0x01) as u64 // no interrupt pending
+            }
+            R_LCR => LCR.load(Ordering::Relaxed) as u64,
+            R_MCR => MCR.load(Ordering::Relaxed) as u64,
+            R_LSR => 0x60, // THRE+TEMT set, DR clear (no incoming data, ever)
+            R_MSR => 0xB0, // CTS+DSR+DCD asserted, no RI
+            R_SCR => SCR.load(Ordering::Relaxed) as u64,
+            _ => 0xFF,
+        };
+    }
     // Demand-driven pump: while KD is active the guest hammers COM2 (polling
     // LSR for DR, popping RBR). Pumping on every access drains the physical
     // 16-byte RX FIFO before it can overflow — the root cause of the link
@@ -162,6 +190,20 @@ pub fn read(off: u16) -> u64 {
 
 /// Guest write of a COM2 register (IOIO #VMEXIT path).
 pub fn write(off: u16, val: u8) {
+    // KD off: update the register shadows so reads round-trip (UART probe),
+    // but never touch the physical port or queue TX — there is no bridge.
+    if !KD_ENABLED {
+        match off {
+            R_RBR_THR => if dlab() { DLL.store(val, Ordering::Relaxed); }, // THR data dropped
+            R_IER_DLM => if dlab() { DLM.store(val, Ordering::Relaxed); } else { IER.store(val, Ordering::Relaxed); },
+            R_IIR_FCR => FCR.store(val, Ordering::Relaxed),
+            R_LCR => LCR.store(val, Ordering::Relaxed),
+            R_MCR => MCR.store(val & 0x1F, Ordering::Relaxed),
+            R_SCR => SCR.store(val, Ordering::Relaxed),
+            _ => {}
+        }
+        return;
+    }
     match off {
         R_RBR_THR => {
             if dlab() {
