@@ -7,6 +7,8 @@ guest (OVMF firmware → Windows / Linux), and presents a fully synthetic,
 host-independent PC identity — CPU, SMBIOS, disk, NIC, TPM, ACPI — driven by a
 `Profile`, with no observable footprint from inside.
 
+> This project was fully generated with AI assistance (Claude, Anthropic).
+
 It is also the research substrate for the anti-cheat work: sitting at L1 (below
 the guest OS), veneer can read, translate, and intercept guest memory beneath
 in-guest defenses (PatchGuard, HVCI) to study `vgk` / `vgc` and feed `fake_vgc`.
