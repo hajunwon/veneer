@@ -307,6 +307,23 @@ pub unsafe fn handle(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
             ebx = (ebx & !0x00FF_0000) | (n << 16);
         }
     }
+    // CPUID leaf 0x80000007 EDX bit 8 = Invariant TSC. VMware's nested-SVM
+    // CPUID clears this, so Windows' HAL rejects the TSC as a QPC source and
+    // falls back to polling the HPET main counter (0xFED000F0) — every read is
+    // an NPF #VMEXIT and, measured across a full boot, the single dominant
+    // cost (the steady-state NPF storm is ~90% HPET). veneer presents a
+    // faithful TSC: RDTSC is filtered through clock::now() during VMware's
+    // step clusters and runs native otherwise, and the dispatcher retunes
+    // VMCB.tsc_offset to the monotonic clock every exit. Advertising invariant
+    // TSC lets Windows use RDTSC as its clocksource and stop hammering the
+    // HPET. (Bits 0..7 / 9.. are power-management capabilities backed by MSRs
+    // we don't model — clear them so we don't advertise an unbacked feature.)
+    if leaf == 0x8000_0007 {
+        edx = 1 << 8;
+        eax = 0;
+        ebx = 0;
+        ecx = 0;
+    }
     // CPUID leaf 0xD — Processor Extended State Enumeration. Linux reads
     // sub-leaf 0 (EAX:EDX = supported user XCR0 bits, EBX = current
     // XSAVE area size, ECX = max XSAVE area size), then walks one sub-

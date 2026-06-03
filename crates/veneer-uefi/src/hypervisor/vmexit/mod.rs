@@ -88,6 +88,21 @@ static PROF_TOTAL: AtomicU32 = AtomicU32::new(0);
 /// native (post-step, fast). Flipped once by the step-absorption check.
 static RDTSC_NATIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// Last VMCB.tsc_offset we programmed, for the monotonic-clamp retune below.
+static TSC_OFFSET_LAST: AtomicU64 = AtomicU64::new(0);
+
+/// INTR-only wedge detector. A pure guest busy-spin (touching only RAM, no
+/// MMIO/IO/MSR) produces NO exits except the host preemption tick, so the
+/// same-RIP detector below — which deliberately skips INTR so the tick can't
+/// mask a deadlock — never sees it. Track the code PAGE the tick keeps
+/// landing in: if the guest is interrupted in the same page for many
+/// consecutive ticks (~seconds at ~200 Hz), it is wedged there. Dump once.
+static INTR_WEDGE_PAGE: AtomicU64 = AtomicU64::new(0);
+static INTR_WEDGE_COUNT: AtomicU32 = AtomicU32::new(0);
+static INTR_WEDGE_DUMPS: AtomicU32 = AtomicU32::new(0);
+const INTR_WEDGE_THRESHOLD: u32 = 600; // ~3 s at 200 Hz
+const INTR_WEDGE_DUMP_CAP: u32 = 4; // distinct slow pages to snapshot
+
 #[inline]
 fn rdtsc_raw() -> u64 {
     let lo: u32;
@@ -135,6 +150,20 @@ pub unsafe fn dispatch(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
     // rather than per now() call.
     if code == exit_code::INTR && crate::infra::clock::host_tick::armed() {
         crate::infra::clock::discipline();
+        // INTR-only wedge detection (see INTR_WEDGE_* docs).
+        let page = rip & !0xFFF;
+        let prev = INTR_WEDGE_PAGE.swap(page, Ordering::Relaxed);
+        let n = if prev == page {
+            INTR_WEDGE_COUNT.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            INTR_WEDGE_COUNT.store(0, Ordering::Relaxed);
+            0
+        };
+        if n == INTR_WEDGE_THRESHOLD
+            && INTR_WEDGE_DUMPS.fetch_add(1, Ordering::Relaxed) < INTR_WEDGE_DUMP_CAP
+        {
+            unsafe { crate::diag::snapshot::dump(vmcb, gprs, "intr-wedge") };
+        }
     }
     // The host preemption tick (physical INTR, ~200 Hz) fires at an arbitrary
     // guest RIP. Skip it in the wedge detector so it doesn't reset the
@@ -192,7 +221,20 @@ pub unsafe fn dispatch(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
     unsafe {
         let host = rdtsc_raw();
         let smooth = crate::infra::clock::now();
-        (*vmcb).control.tsc_offset = smooth.wrapping_sub(host);
+        // Monotonic clamp. Just before this exit the guest could have read
+        // RDTSC = host + old_offset (native phase). Now that QPC is TSC-backed
+        // (cpuid leaf 0x80000007 advertises invariant TSC), retuning the
+        // offset down to `smooth` when VMware has run the host TSC ahead of
+        // real time (catch-up after a busy-spin throttle) would step the
+        // guest TSC — and thus QPC — backward, which Windows treats as fatal.
+        // Clamp the guest TSC up to the smooth clock but never below the
+        // ceiling the guest could already have observed.
+        let old_off = TSC_OFFSET_LAST.load(Ordering::Relaxed);
+        let ceiling = host.wrapping_add(old_off);
+        let guest_tsc = if smooth >= ceiling { smooth } else { ceiling };
+        let new_off = guest_tsc.wrapping_sub(host);
+        (*vmcb).control.tsc_offset = new_off;
+        TSC_OFFSET_LAST.store(new_off, Ordering::Relaxed);
     }
 
     // A++ adaptive phase-switch (hysteresis): RDTSC is INTERCEPTED (filtered →
