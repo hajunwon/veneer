@@ -279,6 +279,14 @@ pub unsafe fn handle(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
         //   ECX bit  8 = TM2  (Thermal Monitor 2 — MSR_THERM2_CTL unbacked)
         ecx &= !(1u32 << 3);
         ecx &= !(1u32 << 8);
+        // ECX bit 24 = TSC-Deadline LAPIC timer. Force it on: VMware's nested
+        // CPUID may clear it, leaving Windows' HAL no per-CPU clock timer but
+        // the HPET comparator — whose servicing reads the HPET counter every
+        // tick (the dominant boot NPF storm). veneer emulates the deadline
+        // timer (lapic::set_tsc_deadline + the inject deadline check), so
+        // advertising it lets Windows arm the clock via MSR 0x6E0 (a cheap
+        // WRMSR) and check it via native RDTSC — no HPET MMIO.
+        ecx |= 1u32 << 24;
         // Paravirt override flips both flags atomically — Linux only
         // probes 0x40000000+ when the hypervisor-present bit is set
         // on leaf 1, so hiding the bit while publishing the signature
@@ -306,6 +314,19 @@ pub unsafe fn handle(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
             let n = effective_core_count();
             ebx = (ebx & !0x00FF_0000) | (n << 16);
         }
+    }
+    // CPUID leaf 0x80000007 EDX bit 8 = Invariant TSC. Required for the guest
+    // to use RDTSC as its clocksource (QPC) instead of polling the HPET MMIO
+    // counter — which under VMware nested SVM is an NPF #VMEXIT per read and the
+    // dominant boot-time cost. veneer's clock::now() is slewed to a smooth
+    // constant rate (see infra/clock), so the TSC behaves like a real invariant
+    // TSC. Bits other than 8 are power-management capabilities backed by MSRs we
+    // don't model — clear them so we advertise only what we honor.
+    if leaf == 0x8000_0007 {
+        eax = 0;
+        ebx = 0;
+        ecx = 0;
+        edx = 1 << 8;
     }
     // CPUID leaf 0xD — Processor Extended State Enumeration. Linux reads
     // sub-leaf 0 (EAX:EDX = supported user XCR0 bits, EBX = current

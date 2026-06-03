@@ -48,6 +48,18 @@ static ANCHOR_REALTIME: AtomicU64 = AtomicU64::new(0);
 static ANCHOR_TSC: AtomicU64 = AtomicU64::new(0);
 static LAST_NOW: AtomicU64 = AtomicU64::new(0);
 
+/// Guest TSC = host TSC + this offset (== ANCHOR_REALTIME - ANCHOR_TSC). The
+/// dispatcher programs it into VMCB.tsc_offset so the guest's NATIVE RDTSC
+/// equals now() WITHOUT a per-exit retune — a per-exit retune jumps the TSC at
+/// every HPET-read exit and breaks Windows' boot-time TSC calibration. It only
+/// changes when the anchor is re-snapped (a rare throttle correction), so the
+/// native TSC stays jump-free and Windows accepts it as an invariant TSC.
+pub fn current_offset() -> u64 {
+    ANCHOR_REALTIME
+        .load(Ordering::Relaxed)
+        .wrapping_sub(ANCHOR_TSC.load(Ordering::Relaxed))
+}
+
 // ── VMware one-time host-TSC step detection ──────────────────────────
 /// A forward raw-RDTSC delta this large is VMware's step, not elapsed time.
 const STEP_THRESHOLD: u64 = 1_000_000_000_000;
@@ -132,8 +144,21 @@ pub fn discipline() {
     if !ENABLED.load(Ordering::Relaxed) {
         return;
     }
-    ANCHOR_REALTIME.store(realtime_from_hpet(), Ordering::Relaxed);
-    ANCHOR_TSC.store(rdtsc(), Ordering::Relaxed);
+    let raw_now = rdtsc();
+    let cur = ANCHOR_REALTIME
+        .load(Ordering::Relaxed)
+        .wrapping_add(raw_now.wrapping_sub(ANCHOR_TSC.load(Ordering::Relaxed)));
+    let target = realtime_from_hpet();
+    // Leave the anchor alone on normal ticks so now() (and the guest's native
+    // TSC, which shares this offset) keeps advancing at the CONSTANT host-TSC
+    // rate, jump-free — the shape Windows' TSC suitability check requires. Only
+    // re-snap when the host TSC has throttled far (~10 ms) behind real time (a
+    // busy-spin stall); leaving it would crawl timed waits. Forward-only.
+    let snap_threshold = (TSC_HZ.load(Ordering::Relaxed) / 100).max(1) as i64;
+    if target.wrapping_sub(cur) as i64 > snap_threshold {
+        ANCHOR_REALTIME.store(target, Ordering::Relaxed);
+        ANCHOR_TSC.store(raw_now, Ordering::Relaxed);
+    }
 }
 
 /// Monotonic, constant-real-rate virtual TSC in host-TSC cycle units.
@@ -154,7 +179,7 @@ pub fn now() -> u64 {
     if !ENABLED.load(Ordering::Relaxed) {
         return raw; // pre-anchor: raw TSC (the anchor starts here)
     }
-    // Real time at the last tick + raw-TSC interpolation since.
+    // Constant host-TSC rate since the last anchor (jump-free between snaps).
     let interp = raw.wrapping_sub(ANCHOR_TSC.load(Ordering::Relaxed));
     let v = ANCHOR_REALTIME.load(Ordering::Relaxed).wrapping_add(interp);
     // Monotonic backstop: a re-anchor that lands just below the interpolated

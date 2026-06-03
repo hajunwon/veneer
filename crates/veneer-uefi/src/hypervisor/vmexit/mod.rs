@@ -216,9 +216,13 @@ pub unsafe fn dispatch(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
     // (NOMINAL advance on implausible deltas), so the guest never sees it and
     // timed waits (cdboot "press any key", winload Stall) keep real durations.
     unsafe {
-        let host = rdtsc_raw();
-        let smooth = crate::infra::clock::now();
-        (*vmcb).control.tsc_offset = smooth.wrapping_sub(host);
+        // Drive the step detector + monotonic backstop via now(), then program
+        // the FIXED guest-TSC offset (changes only on a rare throttle snap, not
+        // per exit). The guest's native RDTSC then equals clock::now() yet stays
+        // jump-free across exits — which is what lets Windows' boot-time TSC
+        // calibration accept it and stop polling the HPET.
+        let _ = crate::infra::clock::now();
+        (*vmcb).control.tsc_offset = crate::infra::clock::current_offset();
     }
 
     // A++ adaptive phase-switch (hysteresis): RDTSC is INTERCEPTED (filtered →
