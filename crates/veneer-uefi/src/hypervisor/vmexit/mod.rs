@@ -88,9 +88,6 @@ static PROF_TOTAL: AtomicU32 = AtomicU32::new(0);
 /// native (post-step, fast). Flipped once by the step-absorption check.
 static RDTSC_NATIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Last VMCB.tsc_offset we programmed, for the monotonic-clamp retune below.
-static TSC_OFFSET_LAST: AtomicU64 = AtomicU64::new(0);
-
 /// INTR-only wedge detector. A pure guest busy-spin (touching only RAM, no
 /// MMIO/IO/MSR) produces NO exits except the host preemption tick, so the
 /// same-RIP detector below — which deliberately skips INTR so the tick can't
@@ -221,20 +218,7 @@ pub unsafe fn dispatch(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
     unsafe {
         let host = rdtsc_raw();
         let smooth = crate::infra::clock::now();
-        // Monotonic clamp. Just before this exit the guest could have read
-        // RDTSC = host + old_offset (native phase). Now that QPC is TSC-backed
-        // (cpuid leaf 0x80000007 advertises invariant TSC), retuning the
-        // offset down to `smooth` when VMware has run the host TSC ahead of
-        // real time (catch-up after a busy-spin throttle) would step the
-        // guest TSC — and thus QPC — backward, which Windows treats as fatal.
-        // Clamp the guest TSC up to the smooth clock but never below the
-        // ceiling the guest could already have observed.
-        let old_off = TSC_OFFSET_LAST.load(Ordering::Relaxed);
-        let ceiling = host.wrapping_add(old_off);
-        let guest_tsc = if smooth >= ceiling { smooth } else { ceiling };
-        let new_off = guest_tsc.wrapping_sub(host);
-        (*vmcb).control.tsc_offset = new_off;
-        TSC_OFFSET_LAST.store(new_off, Ordering::Relaxed);
+        (*vmcb).control.tsc_offset = smooth.wrapping_sub(host);
     }
 
     // A++ adaptive phase-switch (hysteresis): RDTSC is INTERCEPTED (filtered →
