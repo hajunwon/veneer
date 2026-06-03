@@ -24,6 +24,7 @@
 //! comparator is interrupt-capable — without them Windows' HAL treats
 //! HPET as a counter-only QPC source and finds no system clock timer.
 
+use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const HPET_BASE: u64 = 0xFED0_0000;
@@ -68,6 +69,90 @@ static TIMER_FSB: [AtomicU64; N_TIMERS]       = [TIMER_INIT; N_TIMERS];
 /// (0) is never written, so it never arms — only an explicit guest write
 /// does, which is what distinguishes a real deadline from the stale default.
 static T0_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+// ───── Writable-shadow MMIO (NPF-storm elimination) ──────────────────
+//
+// Trapping every HalpHpetArmTimer access (main-counter read 0x0F0, timer-0
+// config 0x100, comparator write 0x108 — ~7 NPF per ~2 ms arm) costs ~155 µs
+// EACH under VMware nested SVM, so the per-tick re-arm storms boot time. Instead
+// we back the HPET MMIO page with a writable host page mapped into the NPT, so
+// the guest's reads/writes hit RAM with no VMEXIT. veneer reconciles lazily from
+// the dispatcher (`shadow_tick`, every #VMEXIT and at minimum every host
+// preemption tick): it publishes the live main counter into 0x0F0, re-asserts
+// the read-only per-timer capability bits, pulls the guest-written config, and
+// reads the comparator to (re)arm the one-shot deadline. The arm delta is ~2 ms
+// and shadow_tick runs far more often than that, so the published counter is
+// fresh enough that the guest never computes an already-past deadline.
+//
+// `0` = shadow disabled (legacy trapped path via read/write_register_width).
+static BACKING: AtomicU64 = AtomicU64::new(0);
+/// The deadline most recently fired, so shadow_tick doesn't re-arm the same
+/// comparator value after `timer0_serviced` until the guest writes a new one.
+static LAST_FIRED: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+unsafe fn bget(off: u32) -> u64 {
+    read_volatile((BACKING.load(Ordering::Relaxed) + off as u64) as *const u64)
+}
+#[inline]
+unsafe fn bset(off: u32, v: u64) {
+    write_volatile((BACKING.load(Ordering::Relaxed) + off as u64) as *mut u64, v);
+}
+
+/// Install the writable backing page (host VA == HPA under UEFI identity
+/// mapping). Called once after main.rs maps it into the NPT at HPET_BASE.
+/// Seeds the static read-only registers so the guest's first reads are correct.
+pub fn set_backing(ptr: u64) {
+    BACKING.store(ptr, Ordering::Relaxed);
+    unsafe {
+        // Zero the whole page, then seed the read-only / capability registers.
+        core::ptr::write_bytes(ptr as *mut u8, 0, HPET_SIZE as usize);
+        bset(0x000, general_caps());
+        for t in 0..N_TIMERS as u32 {
+            bset(0x100 + t * 0x20, TN_CAP_BITS); // per-timer cap bits
+        }
+        bset(0x0F0, main_counter());
+    }
+    crate::sprintln!("[hpet] writable-shadow MMIO armed at 0x{:X}", ptr);
+}
+
+#[inline]
+pub fn shadow_enabled() -> bool {
+    BACKING.load(Ordering::Relaxed) != 0
+}
+
+/// Reconcile the shadow page with veneer's emulated HPET state. Cheap; called
+/// from the dispatcher after every #VMEXIT (and thus at least every host tick).
+pub fn shadow_tick() {
+    if BACKING.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    unsafe {
+        // Publish the live main counter for guest reads (fresh enough that an
+        // arm at counter+~2ms never lands already-past).
+        bset(0x0F0, main_counter());
+        // Pull guest-written General Config + timer-0 config into veneer state
+        // so t0_enabled()/timer0_gsi() reflect what the guest programmed.
+        GENERAL_CONFIG.store(bget(0x010), Ordering::Relaxed);
+        TIMER_CONFIG[0].store(bget(0x100), Ordering::Relaxed);
+        // Re-assert the read-only capability bits the guest can't keep set
+        // (it writes the config word without them); reads after init still see
+        // the advertised caps. Keep the RO caps register correct too.
+        bset(0x000, general_caps());
+        for t in 0..N_TIMERS as u32 {
+            let cfg = bget(0x100 + t * 0x20);
+            bset(0x100 + t * 0x20, cfg | TN_CAP_BITS);
+        }
+        bset(0x020, GENERAL_INT_STATUS.load(Ordering::Relaxed));
+        // (Re)arm the one-shot deadline from the guest's comparator. Skip a
+        // value we already fired (guest hasn't re-armed yet) so we don't double
+        // fire; an explicit new write (different value) re-arms.
+        let cmp = bget(0x108);
+        if t0_enabled() && cmp != 0 && cmp != LAST_FIRED.load(Ordering::Relaxed) {
+            T0_DEADLINE.store(cmp, Ordering::Relaxed);
+        }
+    }
+}
 
 #[inline]
 pub fn covers(gpa: u64) -> bool {
@@ -165,6 +250,22 @@ const TN_SIZE_CAP: u64 = 1 << 5;      // 64-bit comparator
 // 0..15 are ISA lines and 16..19 are PCI INTx, so advertise the free high
 // lines 20..23. The guest picks one, writes it into Tn_INT_ROUTE_CNF
 // (bits 9..13), and inject.rs delivers the match through that GSI.
+// NOTE: setting TN_INT_ROUTE_CAP to 0 (no interrupt routing) DOES kill the
+// HalpHpetArmTimer NPF storm (npf->0, ~60x faster boot windows), but WEDGES the
+// kernel in a tight PCI-config IO poll (an `in al,dx; ret` helper hammering
+// 0xCF8/0xCFC) — the kernel's PCI/interrupt setup depends on an interrupt-capable
+// HPET, and Path B's smooth LAPIC clock does NOT prevent this. Moving the system
+// clock timer off the HPET cleanly requires Windows to trust the TSC-deadline /
+// LAPIC clock, which needs the Hyper-V hv-frequency / reference-TSC enlightenment
+// (Path A), not just TSC discipline. So keep the HPET interrupt-capable here.
+// Keep the HPET interrupt-capable. Setting this to 0 (no routing) stops the
+// HalpHpetArmTimer NPF storm but makes Windows' HAL initialization FAIL with
+// BUGCHECK 0x5C HAL_INITIALIZATION_FAILED (args 0x110,_,0x14,0xC0000001
+// STATUS_UNSUCCESSFUL) — the HAL has no interrupt-capable clock timer to fall
+// back to (it does NOT switch to the LAPIC timer / TSC-deadline on its own).
+// So the boot-time storm can't be cured by removing the HPET; Windows must be
+// made to TRUST the LAPIC/TSC-deadline clock (Hyper-V enlightenment, Path A) or
+// the LAPIC-timer clock source must be made acceptable to HalpTimerFindIdealClockSource.
 const TN_INT_ROUTE_CAP: u64 = 0xFu64 << 52; // GSIs 20..23
 const TN_CAP_BITS: u64 = TN_PER_INT_CAP | TN_SIZE_CAP | TN_INT_ROUTE_CAP;
 
@@ -203,6 +304,9 @@ pub fn timer0_pending() -> bool {
 /// periodic log above.
 pub fn timer0_serviced() {
     GENERAL_INT_STATUS.fetch_or(1, Ordering::Relaxed);
+    // Remember what we just fired so the writable-shadow reconcile doesn't
+    // re-arm the same comparator before the guest writes a fresh one.
+    LAST_FIRED.store(T0_DEADLINE.load(Ordering::Relaxed), Ordering::Relaxed);
     T0_DEADLINE.store(u64::MAX, Ordering::Relaxed);
 }
 

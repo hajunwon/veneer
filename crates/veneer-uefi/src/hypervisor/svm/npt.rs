@@ -376,6 +376,18 @@ pub fn install_trap_range(npt: &NptRoot, gpa_start: u64, len: u64) -> Result<(),
     Ok(())
 }
 
+/// Allocate a fresh zeroed 4-KiB host page and map it (writable) at guest
+/// `gpa`, so guest accesses to that page hit RAM instead of faulting. Returns
+/// the page's host address (== HPA under UEFI identity mapping), which the
+/// caller can also write to directly to reconcile emulated device state.
+/// Used for the writable-shadow HPET MMIO page (eliminates the per-arm NPF
+/// storm). Replaces an `install_trap_page` for the same GPA.
+pub fn map_backing_page(npt: &NptRoot, gpa: u64) -> Result<u64, NptError> {
+    let page = alloc_zero_page()?;
+    map_page(npt, gpa, page)?;
+    Ok(page)
+}
+
 fn alloc_zero_page() -> Result<u64, NptError> {
     let page = boot::allocate_pages(
         AllocateType::AnyPages,

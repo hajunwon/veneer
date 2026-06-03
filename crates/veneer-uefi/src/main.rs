@@ -491,14 +491,22 @@ fn run_guest(
         ),
         Err(_) => sprintln!("[npt ] NVMe BAR0 trap install failed"),
     }
-    match npt::install_trap_range(&npt_root, devices::irq::hpet::HPET_BASE, devices::irq::hpet::HPET_SIZE) {
-        Ok(_) => sprintln!(
-            "[npt ] trapped HPET MMIO 0x{:016X}..0x{:016X} ({} KiB)",
-            devices::irq::hpet::HPET_BASE,
-            devices::irq::hpet::HPET_BASE + devices::irq::hpet::HPET_SIZE,
-            devices::irq::hpet::HPET_SIZE / 1024
-        ),
-        Err(_) => sprintln!("[npt ] HPET trap install failed"),
+    // HPET MMIO: instead of trapping (every HalpHpetArmTimer re-arm = ~7 NPF
+    // at ~155 us each under nested SVM => boot-time storm), back it with a
+    // writable host page so guest reads/writes hit RAM. veneer reconciles the
+    // counter / comparator lazily in the dispatcher (hpet::shadow_tick).
+    match npt::map_backing_page(&npt_root, devices::irq::hpet::HPET_BASE) {
+        Ok(page) => {
+            devices::irq::hpet::set_backing(page);
+            sprintln!(
+                "[npt ] HPET MMIO writable-shadow at GPA 0x{:016X} -> HPA 0x{:016X}",
+                devices::irq::hpet::HPET_BASE, page
+            );
+        }
+        Err(_) => {
+            sprintln!("[npt ] HPET backing-page map FAILED — falling back to trapped MMIO");
+            let _ = npt::install_trap_range(&npt_root, devices::irq::hpet::HPET_BASE, devices::irq::hpet::HPET_SIZE);
+        }
     }
     match npt::install_trap_range(&npt_root, devices::tpm::TPM_BASE, devices::tpm::TPM_SIZE) {
         Ok(_) => sprintln!(
@@ -1196,6 +1204,20 @@ fn enter_ovmf_guest(
                     HI_RAM_BASE, OVMF_WINDOW_BASE, hi, MMIO_HOLE_BASE, hi2_base
                 ),
                 (a, b) => sprintln!("[ovmf-guest] hi-RAM map failed: lo={:?} hi={:?}", a, b),
+            }
+            // Carve the HPET page (0xFED00000) out of the trapped MMIO hole as a
+            // WRITABLE shadow: the guest's per-tick HalpHpetArmTimer re-arms then
+            // hit RAM instead of faulting (~7 NPF/arm at ~155us each under nested
+            // SVM = boot-time storm). veneer reconciles the counter/comparator in
+            // hpet::shadow_tick (every #VMEXIT). IOAPIC (0xFEC00000) and LAPIC
+            // (0xFEE00000) stay trapped — only this one page becomes RAM-backed.
+            match npt::map_backing_page(&npt_root, devices::irq::hpet::HPET_BASE) {
+                Ok(page) => {
+                    devices::irq::hpet::set_backing(page);
+                    sprintln!("[ovmf-guest] HPET MMIO writable-shadow GPA 0x{:08X} -> HPA 0x{:016X}",
+                        devices::irq::hpet::HPET_BASE, page);
+                }
+                Err(e) => sprintln!("[ovmf-guest] HPET backing map failed: {:?} (stays trapped)", e),
             }
         }
         Err(e) => sprintln!("[ovmf-guest] hi-RAM alloc failed: {:?}", e.status()),

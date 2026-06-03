@@ -115,6 +115,12 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
     //   2. PIT IRQ0     — legacy 8254 tick (fallback the guest uses when
     //                     it disables the LAPIC timer)
     //   3. LAPIC self-IPI
+    // Reconcile the HPET writable-shadow every exit (publishes the live main
+    // counter into the backing page + re-arms timer 0 from the guest's
+    // comparator). Cheap no-op when the shadow isn't enabled. Runs before the
+    // injection gates so the counter stays fresh even when no IRQ is delivered.
+    hpet::shadow_tick();
+
     let c = unsafe { &mut (*vmcb).control };
     // Don't clobber an event the handler itself just staged
     // (e.g., an exception forwarded from #PF intercept).
