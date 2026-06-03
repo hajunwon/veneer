@@ -155,6 +155,15 @@ exec-trapped) so accesses fault into NPF and route to a device emulator.
 Page-table format = long-mode 4-level (PML4→PDPT→PD→PT), 1 GiB/2 MiB huge pages
 split to 4 KiB on demand. `svm/npt.rs`.
 
+**Writable-shadow MMIO (perf exception).** Trapping is the default, but a hot,
+side-effect-light device can instead be backed by a writable host page
+(`npt::map_backing_page`) so the guest's reads/writes hit RAM with no #VMEXIT;
+veneer reconciles the emulated state lazily from the dispatcher. This is how the
+HPET dodges its per-tick `HalpHpetArmTimer` NPF storm (§6) — decisive because
+each NPF is ~155 µs under VMware nested SVM. Only safe where stale-by-one-tick
+reads and a periodic write-back are acceptable (no read-to-clear / write-1-clear
+hot registers); the LAPIC, with EOI/ICR side effects, stays trapped.
+
 ---
 
 ## 6. Device emulation (the synthetic PC)
@@ -162,7 +171,9 @@ split to 4 KiB on demand. `svm/npt.rs`.
 veneer presents a coherent fake machine. Each device class is its own module.
 
 - [x] **IRQ/timers**: LAPIC, IO-APIC, 8259 PIC, 8254 PIT, HPET, RTC/CMOS,
-      interrupt injection
+      interrupt injection. HPET uses a **writable-shadow MMIO page** (§5) +
+      lazy `shadow_tick` reconcile to avoid the per-tick clock-arm NPF storm;
+      it stays interrupt-capable so the HAL clock init doesn't bugcheck 0x5C.
 - [x] **Bus/IO**: PCI config space (CF8/CFC + ECAM), xHCI, VGA, NIC (BAR trap)
 - [x] **Storage**: NVMe + AHCI (MMIO BAR emulation, host-backed disk)
 - [x] **Platform**: ACPI (RSDP/XSDT/FADT/MADT/HPET/MCFG), SMBIOS, fw_cfg,
@@ -257,10 +268,15 @@ Std binary run on the real host (not a runtime layer):
 
 ---
 
-## 12. Current state (2026-06-02)
+## 12. Current state (2026-06-03)
 
-Boots OVMF firmware and runs Windows (tiny11) deep into kernel init. **Blocked**
-on a `KxWaitForSpinLockAndAcquire` spinlock deadlock post-timer-init (see
-[TODO.md](TODO.md) §0 and memory `_active/current_handoff.md`). Runs nested
-under VMware Workstation (AMD SVM, `vhv=true`) for development; the host has
-been hard-freezing during nested-virt work (mitigation: pin vCPUs).
+Boots OVMF firmware and runs Windows (tiny11) into kernel init. The active
+focus is **boot time** under VMware nested SVM, where every #VMEXIT costs
+~155 µs so any MMIO-poll storm dominates. The HPET clock-arm NPF storm is fixed
+with a writable-shadow MMIO page (§5/§6); QPC runs on RDTSC (invariant-TSC +
+TSC-deadline advertised). The prior `KxWaitForSpinLockAndAcquire` kernel-init
+deadlock is no longer hit (boot progresses past it). Remaining boot-time cost:
+an early LAPIC xAPIC MMIO storm before the guest enables x2APIC ([TODO.md](TODO.md)
+§0). Runs nested under VMware Workstation (AMD SVM, `vhv=true`); host
+hard-freeze during nested-virt work is mitigated (vCPU affinity pin + headless +
+`mks.enable3d=FALSE`).

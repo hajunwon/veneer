@@ -46,15 +46,22 @@ PIC / PIT / HPET / RTC, PCI / NVMe / AHCI / xHCI / VGA / NIC, ACPI / SMBIOS /
 fw_cfg / TPM(CRB); profile-driven identity persisted in NVRAM; a VMI +
 stealth-hook research engine; a TPM 2.0 crypto foundation.
 
-The `KxWaitForSpinLockAndAcquire` spinlock deadlock during Windows kernel init is
-**root-caused** (KD callstack): the HAL's clock init holds a high-level spinlock
-while arming the HPET, and the clock interrupt veneer delivers re-enters the same
-lock on the lone boot CPU. The remaining gap is that the guest's IRQL is not
-exposed in any register veneer can observe at this phase, so it can't gate the
-interrupt — next is an in-hypervisor VMI probe of the guest's masking state.
-The host-side gating (VM work hanging the host) is resolved: vCPU affinity pin +
-headless boot + `mks.enable3d=FALSE` (a host NVIDIA-driver `0x3B` BSOD via
-VMware's 3D render path). Outstanding work: [TODO.md](TODO.md).
+The current focus is **boot time**: Windows uses the HPET comparator as its
+system clock timer and re-arms it (`HalpHpetArmTimer`) every ~2 ms, and under
+VMware nested SVM each HPET MMIO access is an NPF #VMEXIT costing ~155 µs — a
+boot-time storm. veneer now backs the HPET MMIO page with a **writable shadow
+page** (guest reads/writes hit RAM; veneer reconciles the counter/comparator
+lazily in `hpet::shadow_tick`), eliminating the steady-state HPET NPF storm
+(~183k → ~2k per window) while keeping the HPET present and interrupt-capable —
+removing it instead bugchecks `0x5C HAL_INITIALIZATION_FAILED`, since the HAL
+won't switch to the LAPIC/TSC-deadline clock on its own. QPC also runs on RDTSC
+now (invariant-TSC + TSC-deadline advertised). The remaining boot-time cost is
+an **early LAPIC xAPIC MMIO storm** before the guest switches to x2APIC. The
+prior `KxWaitForSpinLockAndAcquire` kernel-init deadlock is no longer hit (the
+boot progresses past it with the writable-shadow + the V_IRQ/V_TPR–gated
+injection). Host-side gating (VM work hanging the host) is resolved: vCPU
+affinity pin + headless boot + `mks.enable3d=FALSE` (a host NVIDIA-driver `0x3B`
+BSOD via VMware's 3D render path). Outstanding work: [TODO.md](TODO.md).
 
 Runs nested under VMware Workstation (AMD SVM, `vhv=true`) for development.
 
