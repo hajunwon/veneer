@@ -76,7 +76,7 @@ Last updated 2026-06-03.
 - [x] All warnings → 0 across all three crates (removed linux_loader PVH/bzImage
       dead path ~413 lines; fixed a real msr.rs unreachable arm that would have
       leaked host syscall/FSGS MSRs; crate-level allow(dead_code) for spec maps)
-- [ ] Add a remote + push (`git remote add origin <url>` && `git push -u origin main`)
+- [x] Add a remote + push (`origin` = github.com/hajunwon/veneer.git; `main` tracks `origin/main`)
 - [ ] (optional) gitignore `assets/firmware/variants/` if the repo should be leaner
 
 ## 6. Fingerprints / fidelity
