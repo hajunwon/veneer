@@ -112,9 +112,16 @@ fn tx_pop() -> Option<u8> {
     Some(b)
 }
 
+/// Master switch for the Windows KD transport. When false, COM2 is left
+/// unpresented so the guest's UART probe fails and KD stays off — without it,
+/// Windows' KdPollBreakIn polls COM2 (LSR/MSR) continuously, which under
+/// VMware nested SVM is ~half of all VMEXITs and roughly doubles boot time.
+/// Flip to true only when actually attaching WinDbg to the COM2 pipe.
+const KD_ENABLED: bool = false;
+
 #[inline]
 pub fn covers(port: u16) -> bool {
-    PRESENT.load(Ordering::Relaxed) && port >= COM2 && port <= END
+    KD_ENABLED && PRESENT.load(Ordering::Relaxed) && port >= COM2 && port <= END
 }
 
 /// Guest read of a COM2 register (IOIO #VMEXIT path).
