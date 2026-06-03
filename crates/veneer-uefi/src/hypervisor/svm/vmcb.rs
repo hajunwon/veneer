@@ -307,7 +307,7 @@ pub unsafe fn init_for_cpuid_intercept(vmcb: *mut Vmcb, msrpm_phys: u64, iopm_ph
     // stage_pending runs and the stuck-detector sees the spin. The filter
     // batches: exit only after `count` tight pauses (within `thresh` cycles of
     // each other) so a normal sprinkling of PAUSE doesn't exit every time.
-    c.pause_filter_count = 4096;
+    c.pause_filter_count = 65535;
     c.pause_filter_thresh = 0;
     c.intercept_vec2 = intercept_vec2::VMRUN
         | intercept_vec2::VMMCALL

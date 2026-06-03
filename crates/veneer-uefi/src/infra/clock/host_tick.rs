@@ -124,27 +124,40 @@ pub fn install_and_arm() {
         core::ptr::write_volatile(ent.add(12) as *mut u32, 0u32); // reserved
     }
 
-    // Calibrate the LAPIC timer rate against the host TSC, then arm periodic.
+    // Calibrate the LAPIC timer reload against the host HPET, not the host
+    // TSC: under VMware nested SVM the TSC races wall clock by ~250×, so a
+    // TSC-timed "1 ms" was really ~4 µs and the periodic tick over-fired
+    // ~250× (50 kHz instead of 200 Hz, ~half of all VMEXITs). The host HPET
+    // keeps wall-clock semantics here, so timing the calibration interval on
+    // it yields a reload that fires at the true period.
     let base = lapic_base();
-    let freq = crate::infra::clock::tsc_freq::host_tsc_freq();
+    const HPET: usize = 0xFED0_0000;
+    let _ = idt_base; // (kept above for the gate write)
     unsafe {
+        let cap = core::ptr::read_volatile(HPET as *const u64);
+        let period_fs = (cap >> 32) & 0xFFFF_FFFF;
+        let hpet_hz = if period_fs != 0 { 1_000_000_000_000_000u64 / period_fs } else { 14_318_180 };
+        // Enable the HPET main counter so it advances during the measurement.
+        let hcfg = core::ptr::read_volatile((HPET + 0x10) as *const u64);
+        core::ptr::write_volatile((HPET + 0x10) as *mut u64, hcfg | 1);
+        // HPET ticks spanning one tick period of REAL time.
+        let hpet_per_period = (hpet_hz / 1000).saturating_mul(TICK_PERIOD_MS as u64).max(1);
+
         lapic_wr(base, LAPIC_TIMER_DCR, 0x3); // divide by 16
         // Masked one-shot while we measure the count rate (no interrupt).
         lapic_wr(base, LAPIC_LVT_TIMER, 0x1_0000 | TIMER_VECTOR as u32);
         lapic_wr(base, LAPIC_TIMER_ICR, 0xFFFF_FFFF);
-        let t0 = rdtsc();
+        let h0 = core::ptr::read_volatile((HPET + 0xF0) as *const u64);
         let c0 = lapic_rd(base, LAPIC_TIMER_CCR);
-        let target = (freq / 1000).max(1); // 1 ms of host TSC
-        while rdtsc().wrapping_sub(t0) < target {}
+        while core::ptr::read_volatile((HPET + 0xF0) as *const u64).wrapping_sub(h0) < hpet_per_period {}
         let c1 = lapic_rd(base, LAPIC_TIMER_CCR);
-        let ticks_per_ms = c0.wrapping_sub(c1).max(1);
-        let reload = ticks_per_ms.saturating_mul(TICK_PERIOD_MS).max(1);
-        // Periodic, unmasked, our vector. Reload count = TICK_PERIOD_MS.
+        let reload = c0.wrapping_sub(c1).max(1); // LAPIC ticks in one real period
+        // Periodic, unmasked, our vector.
         lapic_wr(base, LAPIC_LVT_TIMER, 0x2_0000 | TIMER_VECTOR as u32);
         lapic_wr(base, LAPIC_TIMER_ICR, reload);
         crate::sprintln!(
-            "[host-tick] armed: vec=0x{:X} lapic_ticks/ms={} period={}ms (~{}Hz) idt=0x{:X} cs=0x{:X} isr=0x{:X}",
-            TIMER_VECTOR, ticks_per_ms, TICK_PERIOD_MS, 1000 / TICK_PERIOD_MS, idt_base, cs, isr
+            "[host-tick] armed (HPET-cal): vec=0x{:X} reload={} period={}ms (~{}Hz) hpet={}Hz cs=0x{:X} isr=0x{:X}",
+            TIMER_VECTOR, reload, TICK_PERIOD_MS, 1000 / TICK_PERIOD_MS, hpet_hz, cs, isr
         );
     }
     ARMED.store(true, Ordering::Relaxed);

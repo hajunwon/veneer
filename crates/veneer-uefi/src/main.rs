@@ -1404,6 +1404,7 @@ fn linux_vmrun_loop(vmcb_phys: u64, host_ext_save_pa: u64, vmcb_ptr: *mut vmcb::
     let (mut h_cpuid, mut h_msr, mut h_ioio, mut h_pmtmr, mut h_npf, mut h_hlt, mut h_other) =
         (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut h_rdtsc = 0u64;
+    let (mut h_pause, mut h_intr) = (0u64, 0u64);
     let mut last_report_tsc = crate::infra::clock::now();
     // Track the heartbeat RIP across reports so a stall (RIP frozen in a small
     // region) is visible and we can dump the code there once.
@@ -1434,10 +1435,10 @@ fn linux_vmrun_loop(vmcb_phys: u64, host_ext_save_pa: u64, vmcb_ptr: *mut vmcb::
             let rate = if ms > 0 { REPORT_EVERY * 1000 / ms } else { 0 };
             sprintln!("[linux-guest] still running: iter={} RIP=0x{:016X} vclk=0x{:X}", iters, rip, now);
             sprintln!(
-                "[perf] {} exits in {} ms ({}/s) cpuid={} msr={} ioio={} pmtmr={} npf={} hlt={} rdtsc={} other={}",
-                REPORT_EVERY, ms, rate, h_cpuid, h_msr, h_ioio, h_pmtmr, h_npf, h_hlt, h_rdtsc, h_other,
+                "[perf] {} exits in {} ms ({}/s) cpuid={} msr={} ioio={} pmtmr={} npf={} hlt={} rdtsc={} pause={} intr={} other={}",
+                REPORT_EVERY, ms, rate, h_cpuid, h_msr, h_ioio, h_pmtmr, h_npf, h_hlt, h_rdtsc, h_pause, h_intr, h_other,
             );
-            h_cpuid = 0; h_msr = 0; h_ioio = 0; h_pmtmr = 0; h_npf = 0; h_hlt = 0; h_rdtsc = 0; h_other = 0;
+            h_cpuid = 0; h_msr = 0; h_ioio = 0; h_pmtmr = 0; h_npf = 0; h_hlt = 0; h_rdtsc = 0; h_pause = 0; h_intr = 0; h_other = 0;
             last_report_tsc = now;
             // When the heartbeat RIP barely moves between reports, the guest is
             // wedged in a tight region — dump the code + page walk there once so
@@ -1506,6 +1507,8 @@ fn linux_vmrun_loop(vmcb_phys: u64, host_ext_save_pa: u64, vmcb_ptr: *mut vmcb::
             0x400 => h_npf += 1,
             0x78 => h_hlt += 1,
             0x6E | 0x87 => h_rdtsc += 1,
+            0x77 => h_pause += 1,
+            0x60 => h_intr += 1,
             _ => h_other += 1,
         }
 
