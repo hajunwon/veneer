@@ -249,7 +249,13 @@ fn config_write(bus: u8, dev: u8, func: u8, reg: u8, val: u32, width: u8) {
 }
 
 static CFG_WRITE_TRACE: AtomicU32 = AtomicU32::new(0);
-const CFG_WRITE_TRACE_CAP: u32 = 400;
+const CFG_WRITE_TRACE_CAP: u32 = 1500;
+
+// NVMe (dev 2) capability-read trace — per-register last value (reg>>2 bucket,
+// covers 0x00..0xBF). Diagnostic only.
+#[allow(clippy::declare_interior_mutable_const)]
+const CFG_RD_ZERO: AtomicU32 = AtomicU32::new(0);
+static CFG_RD_LAST: [AtomicU32; 48] = [CFG_RD_ZERO; 48];
 
 // ───── BAR sizing model ──────────────────────────────────────────────
 //
@@ -430,6 +436,21 @@ fn config_read(bus: u8, dev: u8, func: u8, reg: u8) -> u32 {
     let dword = config_read_raw(bus, dev, func, reg);
     if bus != 0 || func != 0 || (dev as usize) >= PCI_DEV_COUNT {
         return dword;
+    }
+    // Diagnostic: trace the NVMe (dev 2) capability-region reads so we can see
+    // whether the guest's storage driver walks the MSI / MSI-X capabilities
+    // (interrupt-resource setup) and what it reads. Deduplicated by (reg,value)
+    // and capped. Remove once device-MSI setup is understood.
+    if dev == 2 && (0x06..=0xBF).contains(&reg) {
+        // Per-register dedup: log only when this register's value changes, so
+        // repeated enumeration passes don't drown out the distinct cap walk.
+        let bucket = (reg >> 2) as usize;
+        if bucket < CFG_RD_LAST.len() {
+            let key = 0x8000_0000 | dword; // mark "seen" so initial 0 logs once
+            if CFG_RD_LAST[bucket].swap(key, Ordering::Relaxed) != key {
+                crate::sprintln!("[nvme-cfgrd] reg=0x{:02X} val=0x{:08X}", reg, dword);
+            }
+        }
     }
     match reg {
         0x04 => {

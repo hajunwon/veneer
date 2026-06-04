@@ -198,7 +198,28 @@ fn raise_msix(iv: u16) {
 }
 
 static NVME_TRACE: AtomicU32 = AtomicU32::new(0);
-const NVME_TRACE_CAP: u32 = 120;
+const NVME_TRACE_CAP: u32 = 400;
+
+// MSI-X table-write capture (diagnostic): record the entries the guest's
+// driver programs so the IR remappable format is read from a boot, not guessed.
+static MSIX_WR_TRACE: AtomicU32 = AtomicU32::new(0);
+const MSIX_WR_CAP: u32 = 64;
+
+// Register-access walk (diagnostic): log every BAR0 register touch, collapsing
+// identical consecutive accesses (RDY/CSTS polling spins) into one line, so the
+// exact register sequence a driver performs — and where it stops — is legible.
+static REG_TRACE_N: AtomicU32 = AtomicU32::new(0);
+static REG_TRACE_LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+const REG_TRACE_CAP: u32 = 600;
+fn reg_trace(is_write: bool, off: u32, val: u64) {
+    let key = ((is_write as u64) << 48) | ((off as u64) << 32) | (val & 0xFFFF_FFFF);
+    if REG_TRACE_LAST.swap(key, Ordering::Relaxed) == key {
+        return; // identical to the previous access — fold the polling loop
+    }
+    if REG_TRACE_N.fetch_add(1, Ordering::Relaxed) < REG_TRACE_CAP {
+        crate::sprintln!("[nvme-reg] {} off=0x{:03X} val=0x{:X}", if is_write { "W" } else { "R" }, off, val);
+    }
+}
 
 /// Consume the pending completion vector (called by the injection layer).
 pub fn pending_irq() -> Option<u8> {
@@ -273,10 +294,13 @@ pub fn read_register_width(offset: u32, width: u8) -> u64 {
     let aligned = offset & !0x3;
     let shift_bits = (offset & 0x3) * 8;
     let dword = read_dword(aligned);
-    ((dword as u64) >> shift_bits) & low_mask(width)
+    let val = ((dword as u64) >> shift_bits) & low_mask(width);
+    reg_trace(false, offset, val);
+    val
 }
 
 pub fn write_register_width(offset: u32, val: u64, width: u8) {
+    reg_trace(true, offset, val & low_mask(width));
     let aligned = offset & !0x3;
     let shift_bits = (offset & 0x3) * 8;
     let mask_u32 = (low_mask(width) as u32).wrapping_shl(shift_bits);
@@ -360,6 +384,25 @@ pub fn write_register_width(offset: u32, val: u64, width: u8) {
             unsafe {
                 let prev = MSIX_TABLE[idx];
                 MSIX_TABLE[idx] = (prev & !mask_u32) | val_u32;
+            }
+            // Capture what the guest programs into the MSI-X table so the IR
+            // remappable format (addr handle vs data index) can be read off a
+            // boot rather than guessed. Log the whole entry once its control
+            // dword (word%4==3) settles. Diagnostic only — no delivery change.
+            if idx % 4 == 3 {
+                let entry = idx & !3;
+                let n = MSIX_WR_TRACE.fetch_add(1, Ordering::Relaxed);
+                if n < MSIX_WR_CAP {
+                    let ir = crate::hardware::devices::iommu::ir_active();
+                    let (alo, ahi, data, ctrl) = unsafe {
+                        (MSIX_TABLE[entry], MSIX_TABLE[entry + 1],
+                         MSIX_TABLE[entry + 2], MSIX_TABLE[entry + 3])
+                    };
+                    crate::sprintln!(
+                        "[nvme-msix] entry={} ir={} addr=0x{:08X}_{:08X} data=0x{:X} ctrl=0x{:X}",
+                        entry / 4, ir, ahi, alo, data, ctrl,
+                    );
+                }
             }
         }
         a if a >= DOORBELL_BASE => {

@@ -117,10 +117,11 @@ pub fn eoi_broadcast(vector: u8) {
     }
 }
 
-/// Diagnostic: dump redirection entries 0..16 (vector + mask) so we can
-/// see which IRQ lines the guest has actually programmed and unmasked.
+/// Diagnostic: dump all 24 redirection entries (vector + mask) so we can
+/// see which IRQ lines the guest has actually programmed and unmasked —
+/// including the PCI INTx lines (_PRT routes them to GSI 16..19).
 pub fn debug_dump() {
-    for gsi in 0..16usize {
+    for gsi in 0..N_REDIR_ENTRIES {
         let v = REDIR[gsi].load(Ordering::Relaxed);
         let vector = (v & 0xFF) as u8;
         let masked = v & (1 << 16) != 0;
@@ -185,10 +186,21 @@ fn write_selected(val: u32) {
                 high | guest_low | preserved
             };
             REDIR[entry].store(new, Ordering::Relaxed);
+            // Diagnostic: trace RTE programming as it happens so we can see
+            // which GSIs the guest routes — including PCI INTx (GSI 16..19 via
+            // _PRT). Logs on the low-dword write (vector/mask/delivery), capped.
+            if !is_high && RTE_WR_N.fetch_add(1, Ordering::Relaxed) < 64 {
+                crate::sprintln!(
+                    "[ioapic-wr] RTE[{}] low=0x{:08X} vec=0x{:02X} masked={} delivery={}",
+                    entry, val, val & 0xFF, (val >> 16) & 1, (val >> 8) & 0x7
+                );
+            }
         }
         _ => {}
     }
 }
+
+static RTE_WR_N: AtomicU32 = AtomicU32::new(0);
 
 fn read_dword(offset: u32) -> u32 {
     match offset {
