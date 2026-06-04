@@ -9,3 +9,4 @@ pub mod acpi_pm;
 pub mod kvmclock;
 pub mod fwcfg;
 pub mod i8042;
+pub mod input;

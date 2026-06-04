@@ -1331,6 +1331,10 @@ fn enter_ovmf_guest(
     }
     sprintln!("[ovmf-guest] VMCB primed at reset vector (RIP=0xFFFFFFF0); entering VMRUN");
 
+    // One-shot: report which host UEFI input sources VMware's OVMF exposes,
+    // so the keyboard + mouse pipeline is built on confirmed protocols.
+    devices::input::probe();
+
     // Verification for the independent-periodic-VMEXIT work (host LAPIC timer +
     // INTR intercept): dump the host APIC mode / IDT / timer state so the
     // forced-tick mechanism is built from measured facts, not assumptions.
@@ -1504,14 +1508,12 @@ fn linux_vmrun_loop(vmcb_phys: u64, host_ext_save_pa: u64, vmcb_ptr: *mut vmcb::
         // host UEFI services that stay alive on this guest path. Polled
         // sparsely — far costlier than a VMEXIT. vga::blit self-throttles to
         // ~30 fps internally, so calling it here just paces the cap.
-        // Host-keyboard bridge polled often so interactive UIs (UEFI Boot
-        // Manager menu, OS installer) feel responsive. At an idle menu VMEXITs
-        // are sparse (~2 kHz), so the old 16384-exit gate meant ~8 s of input
-        // latency — keys "didn't work". 0x3FF (~every 1024 exits) keeps it
-        // snappy without flooding UEFI stdin reads during active boot.
-        if iters & 0x3FF == 0 {
-            devices::i8042::poll_host_input();
-        }
+        // Host input bridge (keyboard + mouse). input::poll() self-paces to
+        // ~1 kHz off the virtual clock, so input latency is independent of the
+        // iteration rate (at guest idle, exits are sparse — an iteration-count
+        // gate stretched latency to seconds). Called every iteration; the pace
+        // is enforced inside.
+        devices::input::poll();
         // Pump the COM2 <-> WinDbg KD bridge. Sparse cadence is fine while KD is
         // off (the common case); raise to every-iteration only when actively
         // attaching WinDbg (the physical 16-byte RX FIFO overflows on handshake

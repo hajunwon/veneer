@@ -48,6 +48,7 @@ static PIT_INJ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::n
 static HPET_INJ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static IPI_INJ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static KBD_INJ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static MOUSE_INJ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 // Diagnostic (winload native-spin investigation): counts pending-but-dropped
 // timer IRQs (route masked) and firmware-region idle passes. Remove once the
 // spin is understood.
@@ -193,6 +194,20 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
                 return;
             }
             None => i8042::irq1_serviced(),
+        }
+    }
+    // PS/2 mouse IRQ12 (aux port, legacy ISA line → GSI12). Pointer motion /
+    // button packets from the host bridge wait in the 8042 aux buffer.
+    if i8042::irq12_pending() {
+        match gsi_vector(12) {
+            Some(vector) => {
+                if throttle(&MOUSE_INJ, 4096) { crate::sprintln!("[inject] mouse-irq12 vec=0x{:X}", vector); }
+                raise_virq(c, vector);
+                deliver_gsi(12, vector);
+                i8042::irq12_serviced();
+                return;
+            }
+            None => i8042::irq12_serviced(),
         }
     }
     // 1. LAPIC timer — periodic / one-shot scheduler tick.
