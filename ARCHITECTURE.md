@@ -103,8 +103,9 @@ crates/veneer-uefi/src/
 ├── hardware/          "virtual hardware/tables the guest perceives"
 │   ├── devices/       irq/{lapic,ioapic,pic,pit,hpet,rtc,inject},
 │   │                  bus/{pci,xhci,vga,nic}, storage/{ahci,nvme,backend,
-│   │                  host_ahci}, tpm/*, (root) acpi_pm,kvmclock,fwcfg,i8042
-│   ├── acpi/          RSDP/XSDT/FADT/MADT/HPET tables, acpi_fwcfg, aml
+│   │                  host_ahci}, iommu/{mod,command} (AMD-Vi),
+│   │                  tpm/*, (root) acpi_pm,kvmclock,fwcfg,i8042
+│   ├── acpi/          RSDP/XSDT/FADT/MADT/HPET/MCFG/IVRS tables, acpi_fwcfg, aml
 │   └── identity/      profile, profile_gen, smbios, nvram_io, uefi_vars, active
 ├── guest/             "loads/launches the guest, manages guest RAM"
 │   └── boot/          chain_load, esp_io, guest_blob, guest_mem, linux_loader,
@@ -113,7 +114,9 @@ crates/veneer-uefi/src/
 │   ├── translate, mem VMI read/translate foundation
 │   └── hook/          stealth exec-hook engine (built on the VMI foundation)
 └── diag/              "developer diagnostics; removable without behavior change"
-                       serial_kd (WinDbg KD bridge), validator, report
+                       serial_kd (WinDbg KD bridge), snapshot (guest-state +
+                       bugcheck decode), thread_walk (read-only VMI census),
+                       validator, report
 ```
 
 ---
@@ -176,7 +179,12 @@ veneer presents a coherent fake machine. Each device class is its own module.
       it stays interrupt-capable so the HAL clock init doesn't bugcheck 0x5C.
 - [x] **Bus/IO**: PCI config space (CF8/CFC + ECAM), xHCI, VGA, NIC (BAR trap)
 - [x] **Storage**: NVMe + AHCI (MMIO BAR emulation, host-backed disk)
-- [x] **Platform**: ACPI (RSDP/XSDT/FADT/MADT/HPET/MCFG), SMBIOS, fw_cfg,
+- [~] **IOMMU (AMD-Vi)**: IVRS/IVHD + MMIO registers + command buffer so the
+      HAL's interrupt-remapping init succeeds (required once the guest runs
+      x2APIC). veneer decodes remappable IO-APIC/MSI entries through the guest IR
+      tables (Device Table → IRTE) to the real vector for injection — not a
+      functional DMA remapper (single vCPU; veneer injects directly).
+- [x] **Platform**: ACPI (RSDP/XSDT/FADT/MADT/HPET/MCFG/IVRS), SMBIOS, fw_cfg,
       i8042 (PS/2 kbd), ACPI PM timer, kvmclock
 - [~] **TPM 2.0** (CRB): presence + measured boot today; full crypto planned
       (see §9)

@@ -39,8 +39,8 @@ VMware VM (the required `.vmx` settings), and the development boot loop are in
 
 See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design: the SVM boot /
 VMEXIT flow, NPT layout, the device-emulation set (LAPIC / IO-APIC / PIC / PIT /
-HPET / RTC, PCI / NVMe / AHCI / xHCI / VGA / NIC, ACPI / SMBIOS / fw_cfg / TPM),
-profile-driven identity, and the VMI + stealth-hook engine. Open work lives in
+HPET / RTC / IOMMU, PCI / NVMe / AHCI / xHCI / VGA / NIC, ACPI / SMBIOS / fw_cfg /
+TPM), profile-driven identity, and the VMI + stealth-hook engine. Open work lives in
 **[TODO.md](TODO.md)**.
 
 ## Project structure

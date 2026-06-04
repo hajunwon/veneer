@@ -3,16 +3,26 @@
 Open task list. Design/structure context is in [ARCHITECTURE.md](ARCHITECTURE.md);
 completed work is in the git history.
 
-## 0. Core boot
-- [ ] Early LAPIC xAPIC MMIO storm: the guest hammers the LAPIC via MMIO
-  (`0xFEE00xxx`: LVT timer / init-count / EOI / SVR) before switching to x2APIC,
-  and each access is an NPF #VMEXIT (~155 µs under nested SVM) — now the dominant
-  boot-time cost. Unlike the HPET (writable-shadow), the LAPIC can't be naively
-  RAM-backed (EOI/ICR/timer have side effects veneer must emulate). Options:
-  nudge the guest to x2APIC earlier, or selectively cheapen the hot timer registers.
-- [ ] Confirm Windows Setup is reached end-to-end, and that the old
-  `KxWaitForSpinLockAndAcquire` / VPPT self-deadlock stays resolved there
-  (it is no longer hit through early kernel init).
+## 0. Boot performance + input
+- [ ] x2APIC + interrupt remapping — finish device MSI/MSI-X delivery. Forcing
+  x2APIC (APIC-base EXTD bit) removes the LAPIC xAPIC MMIO NPF storm that
+  otherwise dominates boot, but the HAL then requires AMD-Vi interrupt
+  remapping. The IOMMU + IVRS + IR-table decode are in place and the IO-APIC
+  clock interrupt is delivered (HAL clock init no longer bugchecks 0x5C); device
+  MSI/MSI-X interrupts aren't decoded through the IRTE yet, so Setup stalls in the
+  idle loop waiting on a device wake. Extend `iommu::remap_vector` to the
+  MSI/MSI-X paths (`pci.rs` device MSI, NVMe MSI-X), resolving at injection time
+  so a late IRTE write isn't missed.
+- [ ] Boot-time (xAPIC path, EXTD off): early LAPIC xAPIC MMIO accesses
+  (`0xFEE00xxx`: LVT timer / init-count / current-count / EOI / SVR) are each an
+  NPF #VMEXIT and dominate boot wall-clock. The LAPIC can't be naively RAM-backed
+  like the HPET (EOI/ICR/timer have side effects). Option: selectively cheapen the
+  hot register(s) (likely the timer current-count 0x390 calibration read).
+- [ ] Mouse input: the guest gets keyboard (i8042 PS/2 kbd, IRQ1) but no mouse
+  at all in Setup. Add the i8042 AUX port (PS/2 mouse): aux enable (0xA8) /
+  write-to-aux (0xD4) / the mouse command set (reset→0xAA 0x00, 0xF4 enable,
+  sample-rate, resolution) + feed 3-byte movement packets on IRQ12 from a host
+  mouse source. Simpler + Setup-native vs a USB-HID mouse on the emulated xHCI.
 
 ## 1. TPM 2.0 (full)
 - [ ] P1: object model (TPM2B / TPMT_PUBLIC/SENSITIVE / hierarchies / handle table) + NV persisted in NVRAM + NV_DefineSpace / NV_Write
