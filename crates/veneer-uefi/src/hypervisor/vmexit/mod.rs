@@ -84,6 +84,17 @@ static PROF_CDBOOT: AtomicU32 = AtomicU32::new(0);
 static PROF_FW: AtomicU32 = AtomicU32::new(0);
 static PROF_OTHER: AtomicU32 = AtomicU32::new(0);
 static PROF_TOTAL: AtomicU32 = AtomicU32::new(0);
+// [timer] phase timeline: host-HPET (throttle-immune) wall-clock anchored at the
+// first profiled window, so each [prof] line shows cumulative boot ms + the
+// delta since the previous window — the slow boot phase is the window with the
+// big +delta, and the phase counts on the same line say what it was doing.
+static PROF_BOOT_HPET: AtomicU64 = AtomicU64::new(0);
+static PROF_LAST_HPET: AtomicU64 = AtomicU64::new(0);
+// Awake-worker sampling profiler counters.
+static SAMPLE_TICK: AtomicU32 = AtomicU32::new(0);
+static SAMPLE_LAST: AtomicU32 = AtomicU32::new(0);
+static SAMPLE_DUMPS: AtomicU32 = AtomicU32::new(0);
+const SAMPLE_CAP: u32 = 80;
 /// A++ phase flag: false = RDTSC intercepted (filtered, pre-step), true =
 /// native (post-step, fast). Flipped once by the step-absorption check.
 static RDTSC_NATIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -147,6 +158,30 @@ pub unsafe fn dispatch(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
     // rather than per now() call.
     if code == exit_code::INTR && crate::infra::clock::host_tick::armed() {
         crate::infra::clock::discipline();
+        // Awake-worker sampling profiler: the host preemption tick (physical
+        // INTR) only fires while the guest is RUNNING in VMRUN — during HLT idle
+        // veneer spins on the host, so no INTR exit. So sampling the guest stack
+        // here is automatically biased to the AWAKE context (the worker doing
+        // init), not the idle thread. ~every 2 s (400 ticks @200 Hz), capped.
+        {
+            let tick = SAMPLE_TICK.fetch_add(1, Ordering::Relaxed);
+            // Try only after ≥100 ticks (~0.5 s) since the last dump, so worker
+            // samples spread across the whole boot instead of front-loading.
+            if tick.wrapping_sub(SAMPLE_LAST.load(Ordering::Relaxed)) >= 100
+                && SAMPLE_DUMPS.load(Ordering::Relaxed) < SAMPLE_CAP
+                && unsafe { crate::diag::snapshot::sample_if_worker(vmcb, gprs) }
+            {
+                SAMPLE_LAST.store(tick, Ordering::Relaxed);
+                SAMPLE_DUMPS.fetch_add(1, Ordering::Relaxed);
+            }
+            // SAFE (read-only) replacement for the triple-faulting exec-hook:
+            // once the ntoskrnl base is known, periodically walk the guest
+            // thread list and log who is in a timed wait. Cannot fault the guest.
+            let nb = crate::diag::snapshot::nt_base();
+            if nb != 0 && tick % 1500 == 0 {
+                unsafe { crate::diag::thread_walk::walk(vmcb, nb); }
+            }
+        }
         // INTR-only wedge detection (see INTR_WEDGE_* docs).
         let page = rip & !0xFFF;
         let prev = INTR_WEDGE_PAGE.swap(page, Ordering::Relaxed);
@@ -198,7 +233,16 @@ pub unsafe fn dispatch(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
         else { PROF_OTHER.fetch_add(1, Ordering::Relaxed); }
         let t = PROF_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
         if t % 50000 == 0 {
-            crate::sprintln!("[prof] win50k: lowmem(winload)={} cdboot={} fw(ovmf)={} other={} lastrip=0x{:X}",
+            // [timer] wall-clock via the throttle-immune host HPET.
+            let hz = crate::infra::clock::host_hpet_hz().max(1);
+            let now = crate::infra::clock::host_hpet_now();
+            if PROF_BOOT_HPET.load(Ordering::Relaxed) == 0 { PROF_BOOT_HPET.store(now, Ordering::Relaxed); }
+            let boot = PROF_BOOT_HPET.load(Ordering::Relaxed);
+            let last = PROF_LAST_HPET.swap(now, Ordering::Relaxed);
+            let wall_ms = now.wrapping_sub(boot).saturating_mul(1000) / hz;
+            let delta_ms = if last != 0 { now.wrapping_sub(last).saturating_mul(1000) / hz } else { 0 };
+            crate::sprintln!("[timer] @{}ms (+{}ms) win50k: winload={} cdboot={} fw={} kernel={} lastrip=0x{:X}",
+                wall_ms, delta_ms,
                 PROF_LOWMEM.swap(0, Ordering::Relaxed),
                 PROF_CDBOOT.swap(0, Ordering::Relaxed),
                 PROF_FW.swap(0, Ordering::Relaxed),

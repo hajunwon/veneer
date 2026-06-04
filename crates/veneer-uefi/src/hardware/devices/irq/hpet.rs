@@ -151,7 +151,36 @@ pub fn shadow_tick() {
         if t0_enabled() && cmp != 0 && cmp != LAST_FIRED.load(Ordering::Relaxed) {
             T0_DEADLINE.store(cmp, Ordering::Relaxed);
         }
+        // DIAG (x2APIC clock-delivery): periodically dump HPET timer-0 state plus
+        // the IO-APIC route for its GSI. Reveals whether the Windows clock (vec
+        // 0xd1) is HPET-driven and, if so, why it never fires / delivers.
+        let dn = SHADOW_DIAG_N.fetch_add(1, Ordering::Relaxed);
+        if dn % 300_000 == 0 {
+            let gsi = timer0_gsi();
+            let rte = crate::hardware::devices::irq::ioapic::redirection(gsi as usize);
+            crate::sprintln!(
+                "[hpet-diag] cnt={:#x} deadline={:#x} cmp={:#x} t0_en={} gencfg={:#x} gsi={} rte={:?}",
+                main_counter(), T0_DEADLINE.load(Ordering::Relaxed), cmp, t0_enabled(),
+                GENERAL_CONFIG.load(Ordering::Relaxed), gsi, rte
+            );
+        }
     }
+}
+
+static SHADOW_DIAG_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Diagnostic snapshot: (live main counter, armed one-shot deadline, the
+/// guest-written timer-0 comparator). When the shadow is on, the comparator is
+/// read straight from the backing page — so comparing it against the armed
+/// deadline reveals whether a not-yet-reconciled guest re-arm is being missed
+/// (e.g. by the HLT idle spin, which doesn't run shadow_tick).
+pub fn diag_state() -> (u64, u64, u64) {
+    let cmp = if BACKING.load(Ordering::Relaxed) != 0 {
+        unsafe { bget(0x108) }
+    } else {
+        TIMER_COMPARE[0].load(Ordering::Relaxed)
+    };
+    (main_counter(), T0_DEADLINE.load(Ordering::Relaxed), cmp)
 }
 
 #[inline]

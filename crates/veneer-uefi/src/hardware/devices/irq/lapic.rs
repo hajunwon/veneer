@@ -465,11 +465,43 @@ const TIMER_TRACE_CAP: u32 = 24;
 /// scheduler pass — logging each one crawls the guest on the slow UART).
 static ICR_TRACE: AtomicU32 = AtomicU32::new(0);
 
+// ── xAPIC MMIO NPF-storm profiler (temporary) ──
+// Each LAPIC MMIO access is an NPF #VMEXIT (~155 µs under nested SVM); early
+// boot storms on it before the guest switches to x2APIC. Count accesses by
+// register (read vs write) so the hot ones are known before optimizing.
+#[allow(clippy::declare_interior_mutable_const)]
+const LPZ: AtomicU32 = AtomicU32::new(0);
+static LP_R: [AtomicU32; 12] = [LPZ; 12];
+static LP_W: [AtomicU32; 12] = [LPZ; 12];
+fn lp_bucket(aligned: u32) -> usize {
+    match aligned {
+        0x020 => 0, 0x080 => 1, 0x0B0 => 2, 0x0F0 => 3, 0x280 => 4, 0x300 => 5,
+        0x310 => 6, 0x320 => 7, 0x380 => 8, 0x390 => 9, 0x3E0 => 10, _ => 11,
+    }
+}
+static LP_TOTAL: AtomicU32 = AtomicU32::new(0);
+fn lp_prof(aligned: u32, is_write: bool) {
+    let arr = if is_write { &LP_W } else { &LP_R };
+    arr[lp_bucket(aligned)].fetch_add(1, Ordering::Relaxed);
+    // Log the full read/write histogram every 50k LAPIC MMIO accesses.
+    if (LP_TOTAL.fetch_add(1, Ordering::Relaxed) + 1) % 50_000 == 0 {
+        crate::sprintln!(
+            "[lapic-prof] R: id020={} tpr080={} svr0F0={} esr280={} icr300={} lvt320={} init380={} cur390={} dcr3E0={} | W: eoi0B0={} icr300={} lvt320={} init380={}",
+            LP_R[0].load(Ordering::Relaxed), LP_R[1].load(Ordering::Relaxed), LP_R[3].load(Ordering::Relaxed),
+            LP_R[4].load(Ordering::Relaxed), LP_R[5].load(Ordering::Relaxed), LP_R[7].load(Ordering::Relaxed),
+            LP_R[8].load(Ordering::Relaxed), LP_R[9].load(Ordering::Relaxed), LP_R[10].load(Ordering::Relaxed),
+            LP_W[2].load(Ordering::Relaxed), LP_W[5].load(Ordering::Relaxed), LP_W[7].load(Ordering::Relaxed),
+            LP_W[8].load(Ordering::Relaxed),
+        );
+    }
+}
+
 pub fn read_register_width(offset: u32, width: u8) -> u64 {
     let aligned = offset & !0x3;
     let shift_bits = (offset & 0x3) * 8;
     let dword = read_dword(aligned);
     let val = ((dword as u64) >> shift_bits) & low_mask(width);
+    lp_prof(aligned, false);
     let n = LAPIC_READ_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < LAPIC_TRACE_CAP {
         crate::sprintln!("[lapic] R[0x{:03X}].{}B = 0x{:X} (#{}/{})", offset, width, val, n + 1, LAPIC_TRACE_CAP);
@@ -484,6 +516,7 @@ pub fn read_register_width(offset: u32, width: u8) -> u64 {
 }
 
 pub fn write_register_width(offset: u32, val: u64, width: u8) {
+    lp_prof(offset & !0x3, true);
     let n = LAPIC_WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < LAPIC_TRACE_CAP {
         crate::sprintln!("[lapic] W[0x{:03X}].{}B = 0x{:X} (#{}/{})", offset, width, val, n + 1, LAPIC_TRACE_CAP);

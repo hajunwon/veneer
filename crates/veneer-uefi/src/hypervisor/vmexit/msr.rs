@@ -220,10 +220,15 @@ const SYNTH_MTRR_DEF_TYPE: u64 = 0x0000_0000_0000_0806;
 /// per slot, packed into the 64-bit value as 8 bytes of 0x06.
 const SYNTH_MTRR_FIX_WB: u64 = 0x0606_0606_0606_0606;
 
-/// APIC base reset-ish default before the guest writes it: xAPIC global
-/// enable (bit 11) + BSP (bit 8) + the architectural base 0xFEE00000.
-/// x2APIC-enable (bit 10) is off until the guest sets it (shadowed).
-const SYNTH_APIC_BASE: u64 = 0xFEE0_0900;
+/// APIC base default before the guest writes it: xAPIC global enable (bit 11) +
+/// BSP (bit 8) + base 0xFEE00000.
+/// NOTE: pre-setting x2APIC EXTD (bit 10 → 0xFEE00D00) DOES make Windows enable
+/// x2APIC (LAPIC NPF 99k→0, lever proven), but the current x2APIC MSR emulation
+/// (x2apic_read/write below) is incorrect enough that the kernel bugchecks into
+/// HaliHaltSystem early. Keep EXTD off until the emulation is fixed (the IPI /
+/// self-test / register-readback path the kernel verifies). The MSR routing
+/// stays in place but dormant (the guest never touches 0x800-0x8FF in xAPIC).
+const SYNTH_APIC_BASE: u64 = 0xFEE0_0D00;
 /// IA32_MISC_ENABLE default: fast-strings (bit 0) on, everything else off.
 /// Notably limit-CPUID-maxval (bit 22) clear so the guest sees the full
 /// leaf range, and XD-disable (bit 34) clear so NX stays available.
@@ -320,9 +325,77 @@ fn mtrr_trace_write(msr: u32, v: u64) {
     }
 }
 
+// x2APIC MSR range (0x800-0x8FF) — routed to the LAPIC emulator so the guest
+// drives the APIC via cheap MSR exits instead of trapped MMIO (NPF). MSR 0x800+N
+// maps to xAPIC MMIO offset N<<4; ICR is a single 64-bit MSR, EOI is write-only,
+// and 0x83F is the x2APIC self-IPI (no MMIO equivalent).
+const X2APIC_LO: u32 = 0x800;
+const X2APIC_HI: u32 = 0x8FF;
+
+fn x2apic_read(msr: u32) -> u64 {
+    use crate::hardware::devices::irq::lapic;
+    match msr {
+        0x802 => (lapic::read_register(0x20) >> 24) as u64, // x2APIC ID (full 32-bit)
+        0x830 => {
+            // ICR: 64-bit (xAPIC ICR_LO 0x300 + ICR_HI 0x310).
+            let lo = lapic::read_register(0x300) as u64;
+            let hi = lapic::read_register(0x310) as u64;
+            (hi << 32) | lo
+        }
+        0x80B | 0x83F => 0, // EOI / SELF IPI: write-only, read as 0
+        _ => lapic::read_register((msr - 0x800) << 4) as u64,
+    }
+}
+
+fn x2apic_write(msr: u32, val: u64) {
+    use crate::hardware::devices::irq::lapic;
+    let lo = val & 0xFFFF_FFFF;
+    match msr {
+        0x80B => lapic::write_register_width(0xB0, 0, 4), // EOI (write-1-to-signal)
+        0x830 => {
+            // ICR 64-bit: program destination (high) first, then ICR_LO which
+            // triggers delivery (the LAPIC's 0x300 handler stages the IPI).
+            lapic::write_register_width(0x310, (val >> 32) & 0xFFFF_FFFF, 4);
+            lapic::write_register_width(0x300, lo, 4);
+        }
+        0x83F => {
+            // SELF IPI: Fixed delivery + self shorthand (ICR bits 18:19 = 01),
+            // vector in low 8 bits — reuse the ICR_LO self-IPI path.
+            lapic::write_register_width(0x300, (val & 0xFF) | (0b01u64 << 18), 4);
+        }
+        _ => lapic::write_register_width((msr - 0x800) << 4, lo, 4),
+    }
+}
+
+// Trace x2APIC MSR traffic to COM1 while debugging the EXTD halt. Capped so a
+// busy guest can't flood the serial log. EOI (0x80B) is dropped outright: it is
+// write-only/val=0 and the firmware's AHCI ISO-load polling writes it hundreds
+// of times, which used to exhaust the cap inside OVMF before the Windows kernel
+// ran at all. Skipping it lets the budget reach the kernel x2APIC programming
+// and the halt point.
+static X2_TRACE_N: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+fn x2_trace(rw: &str, msr: u32, val: u64) {
+    if msr == 0x80B {
+        return;
+    }
+    if X2_TRACE_N.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8192 {
+        crate::sprintln!("[x2 {} msr={:#06x} val={:#018x}]", rw, msr, val);
+    }
+}
+
 pub unsafe fn handle_rdmsr(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
     let s = unsafe { &mut (*vmcb).state };
     let msr = gprs.rcx as u32;
+
+    // x2APIC: route to the LAPIC emulator (not shadowed, not the host APIC).
+    if (X2APIC_LO..=X2APIC_HI).contains(&msr) {
+        let v = x2apic_read(msr);
+        x2_trace("R", msr, v);
+        s.rax = v & 0xFFFF_FFFF;
+        gprs.rdx = (v >> 32) & 0xFFFF_FFFF;
+        s.rip = s.rip.wrapping_add(lengths::RDMSR);
+        return Action::Resume;
+    }
 
     // Vendor consistency: an AMD-advertised CPU #GPs on Intel-private MSRs.
     // Checked before the shadow so a value stored under an Intel profile
@@ -522,6 +595,14 @@ pub unsafe fn handle_wrmsr(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
     let s = unsafe { &mut (*vmcb).state };
     let msr = gprs.rcx as u32;
     let val = (s.rax & 0xFFFF_FFFF) | ((gprs.rdx & 0xFFFF_FFFF) << 32);
+
+    // x2APIC: route to the LAPIC emulator (not shadowed, not the host APIC).
+    if (X2APIC_LO..=X2APIC_HI).contains(&msr) {
+        x2_trace("W", msr, val);
+        x2apic_write(msr, val);
+        s.rip = s.rip.wrapping_add(lengths::WRMSR);
+        return Action::Resume;
+    }
 
     // Vendor consistency: writing an Intel-private MSR on an AMD-advertised
     // CPU #GPs. Inject the fault and don't advance RIP (mirrors RDMSR side).

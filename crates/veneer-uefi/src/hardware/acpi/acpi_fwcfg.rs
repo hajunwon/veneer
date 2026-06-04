@@ -149,11 +149,12 @@ pub fn build_and_stage(n_vcpus: usize) {
     let spcr = a.spcr_phys as usize;
     let wsmt = a.wsmt_phys as usize;
     let tpm2 = a.tpm2_phys as usize;
+    let ivrs = a.ivrs_phys as usize;
     // FACS has no header/checksum and isn't in the XSDT; FADT points to it.
     let facs = a.facs_phys as usize;
     // Blob length = the furthest table end. DSDT sits past TPM2 (it needs the
     // 2 KiB page tail for _CRS/_PRT), so don't assume TPM2 is last.
-    let tables_len = [xsdt, fadt, madt, mcfg, hpet, dsdt, ssdt, facs, spcr, wsmt, tpm2]
+    let tables_len = [xsdt, fadt, madt, mcfg, hpet, dsdt, ssdt, facs, spcr, wsmt, tpm2, ivrs]
         .iter()
         .map(|&off| off + unsafe { table_len(tables, off) } as usize)
         .max()
@@ -171,7 +172,7 @@ pub fn build_and_stage(n_vcpus: usize) {
     // Tables blob: drop the dead RSDP twin and zero every checksum byte so
     // the loader's ADD_CHECKSUM produces a correct sum (it includes the
     // checksum byte in its range, so it must start at zero).
-    let checksummed = [xsdt, fadt, madt, mcfg, hpet, dsdt, ssdt, spcr, wsmt, tpm2];
+    let checksummed = [xsdt, fadt, madt, mcfg, hpet, dsdt, ssdt, spcr, wsmt, tpm2, ivrs];
     unsafe {
         core::ptr::write_bytes(tables as *mut u8, 0, TABLES_HEAD_DEAD);
         for &off in &checksummed {
@@ -186,7 +187,7 @@ pub fn build_and_stage(n_vcpus: usize) {
         l.alloc(FILE_RSDP, 16, ZONE_FSEG);
 
         // XSDT entries → each secondary table (same order build_at wrote).
-        let xsdt_entries = [fadt, madt, mcfg, hpet, ssdt, spcr, wsmt, tpm2];
+        let xsdt_entries = [fadt, madt, mcfg, hpet, ssdt, spcr, wsmt, tpm2, ivrs];
         for i in 0..field::XSDT_ENTRY_COUNT {
             let off = xsdt + field::HEADER_SIZE + i * 8;
             l.add_pointer(FILE_TABLES, off as u32, FILE_TABLES, 8);

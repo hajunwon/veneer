@@ -128,6 +128,21 @@ struct MadtLocalApic {
     flags: u32,                 // bit 0 = enabled
 }
 
+/// Processor Local x2APIC (MADT type 9, 16 bytes). Presenting the CPUs as
+/// x2APIC (instead of type-0 Local APIC) makes Windows enable x2APIC mode, so
+/// the guest drives the LAPIC via cheap MSRs (RDMSR/WRMSR) instead of trapped
+/// MMIO — each xAPIC MMIO access is an NPF #VMEXIT (~155 µs under nested SVM)
+/// and the per-tick EOI/IPI traffic dominates the awake boot time.
+#[repr(C, packed)]
+struct MadtLocalX2Apic {
+    type_: u8,                  // 9 = Processor Local x2APIC
+    length: u8,                 // 16
+    reserved: u16,              // 0
+    x2apic_id: u32,
+    flags: u32,                 // bit 0 = enabled
+    acpi_processor_uid: u32,
+}
+
 /// MCFG (PCIe Memory-Mapped Configuration Space) — ACPI table that
 /// publishes the base address used by `[bus][dev][func][reg]` MMIO
 /// accesses, so guests with PCIe-aware drivers know where to find it.
@@ -349,6 +364,7 @@ pub struct Acpi {
     pub spcr_phys: u64,
     pub wsmt_phys: u64,
     pub tpm2_phys: u64,
+    pub ivrs_phys: u64,
 }
 
 /// PCIe MMCONFIG base. 0xE000_0000 keeps it well clear of the LAPIC
@@ -383,8 +399,8 @@ pub mod field {
     /// RSDP is 36 bytes at ACPI 2.0+; the 1.0 checksum covers the first 20.
     pub const RSDP_LEN: usize = 36;
     pub const RSDP_V1_CHECKSUM_LEN: usize = 20;
-    /// XSDT carries 8 × 64-bit table pointers (see `build_at`).
-    pub const XSDT_ENTRY_COUNT: usize = 8;
+    /// XSDT carries 9 × 64-bit table pointers (see `build_at`).
+    pub const XSDT_ENTRY_COUNT: usize = 9;
 }
 
 // Neutral ACPI identity fallbacks — used only if no profile is active.
@@ -489,6 +505,9 @@ pub unsafe fn build_at(host_dest: u64, guest_base: u64, n_vcpus: usize) -> Acpi 
     let madt_dest = host_dest + 0x220;
     let mcfg_dest = host_dest + 0x300;
     let hpet_dest = host_dest + 0x380;
+    // IVRS (AMD-Vi IOMMU) — small (~0x5C B), fits the gap between HPET (ends
+    // ~0x3B8) and SSDT (0x500).
+    let ivrs_dest = host_dest + 0x3C0;
     // DSDT carries _CRS + _PRT now (≈0.7 KiB), too big for the old 0x100
     // slot — give it the 2 KiB tail of the page (the other fixed tables all
     // end before 0x700).
@@ -505,6 +524,7 @@ pub unsafe fn build_at(host_dest: u64, guest_base: u64, n_vcpus: usize) -> Acpi 
     let madt_phys = guest_base + 0x220;
     let mcfg_phys = guest_base + 0x300;
     let hpet_phys = guest_base + 0x380;
+    let ivrs_phys = guest_base + 0x3C0;
     let dsdt_phys = guest_base + 0x800;
     let ssdt_phys = guest_base + 0x500;
     let facs_phys = guest_base + 0x540;
@@ -613,7 +633,8 @@ pub unsafe fn build_at(host_dest: u64, guest_base: u64, n_vcpus: usize) -> Acpi 
     let madt_header_size = core::mem::size_of::<Madt>();
     let ioapic_size = core::mem::size_of::<MadtIoApic>();
     let override_size = core::mem::size_of::<MadtIntOverride>();
-    let lapic_size = core::mem::size_of::<MadtLocalApic>();
+    // Present CPUs as x2APIC (type 9) so Windows uses the MSR APIC path.
+    let lapic_size = core::mem::size_of::<MadtLocalX2Apic>();
     let madt_total = (madt_header_size + ioapic_size + override_size + n * lapic_size) as u32;
     let madt_ptr = madt_dest as *mut Madt;
     unsafe {
@@ -657,13 +678,14 @@ pub unsafe fn build_at(host_dest: u64, guest_base: u64, n_vcpus: usize) -> Acpi 
     // ceil(log2(N)) core-shift width leaf 0x80000008.ECX[15:12] reports.
     let mut lapic_off = madt_dest + (madt_header_size + ioapic_size + override_size) as u64;
     for i in 0..n {
-        let lapic_ptr = lapic_off as *mut MadtLocalApic;
+        let lapic_ptr = lapic_off as *mut MadtLocalX2Apic;
         unsafe {
-            (*lapic_ptr).type_ = 0;
+            (*lapic_ptr).type_ = 9; // Processor Local x2APIC
             (*lapic_ptr).length = lapic_size as u8;
-            (*lapic_ptr).acpi_processor_uid = i as u8;
-            (*lapic_ptr).apic_id = i as u8;
+            (*lapic_ptr).reserved = 0;
+            (*lapic_ptr).x2apic_id = i as u32;
             (*lapic_ptr).flags = 1; // enabled
+            (*lapic_ptr).acpi_processor_uid = i as u32;
         }
         lapic_off += lapic_size as u64;
     }
@@ -843,9 +865,51 @@ pub unsafe fn build_at(host_dest: u64, guest_base: u64, n_vcpus: usize) -> Acpi 
         (*tpm2_ptr).header.checksum = 0u8.wrapping_sub(sum);
     }
 
-    // ---- XSDT (FADT + MADT + MCFG + HPET + SSDT + SPCR + WSMT + TPM2) ─
+    // ---- IVRS (AMD-Vi IOMMU) ----
+    // Presents an IOMMU so HalpIommuHsaDiscover finds one: with x2APIC the HAL
+    // marks interrupt remapping required and bugchecks 0x5C if no IOMMU exists.
+    // The IVHD "IOMMU Base Address" is an absolute MMIO address (not a
+    // blob-relative pointer), so the fw_cfg loader must NOT relocate it.
+    unsafe {
+        let ivhd_dev_entries: usize = 4; // one type-0x01 "All devices" entry
+        let ivhd_len = 0x28 + ivhd_dev_entries; // IVHD type 0x11 header + entries
+        let ivrs_total = 0x30 + ivhd_len; // IVRS header+IVinfo+reserved = 0x30
+        core::ptr::write_bytes(ivrs_dest as *mut u8, 0, ivrs_total);
+        let hdr = ivrs_dest as *mut AcpiTableHeader;
+        (*hdr).signature = *b"IVRS";
+        (*hdr).length = ivrs_total as u32;
+        (*hdr).revision = 2;
+        (*hdr).oem_id = oem_id;
+        (*hdr).oem_table_id = oem_table_id;
+        (*hdr).oem_revision = 1;
+        (*hdr).creator_id = creator;
+        (*hdr).creator_revision = 1;
+        // IVinfo @0x24: bit0 EFRSup=1 (HalpIommuHsaDiscover requires it), bit1=0
+        // selects the type-0x11 IVHD path. GVASize(7:5)=2, PASize(14:8)=48.
+        let ivinfo: u32 = 0x1 | (2u32 << 5) | (48u32 << 8);
+        core::ptr::write_unaligned((ivrs_dest + 0x24) as *mut u32, ivinfo);
+        // ---- IVHD type 0x11 @ 0x30 ----
+        let h = (ivrs_dest + 0x30) as *mut u8;
+        *h.add(0) = 0x11; // Type
+        *h.add(1) = 0; // Flags
+        core::ptr::write_unaligned(h.add(2) as *mut u16, ivhd_len as u16); // Length
+        core::ptr::write_unaligned(h.add(4) as *mut u16, crate::hardware::devices::iommu::IOMMU_PCI_BDF); // DeviceID
+        core::ptr::write_unaligned(h.add(6) as *mut u16, crate::hardware::devices::iommu::IOMMU_CAP_OFFSET); // Cap offset
+        core::ptr::write_unaligned(h.add(8) as *mut u64, crate::hardware::devices::iommu::IOMMU_MMIO_BASE); // IOMMU base (abs MMIO)
+        core::ptr::write_unaligned(h.add(0x10) as *mut u16, 0); // PCI segment group
+        core::ptr::write_unaligned(h.add(0x12) as *mut u16, 0); // IOMMU info
+        core::ptr::write_unaligned(h.add(0x14) as *mut u32, 0); // IOMMU attributes
+        core::ptr::write_unaligned(h.add(0x18) as *mut u64, crate::hardware::devices::iommu::IOMMU_EFR); // EFR image
+        core::ptr::write_unaligned(h.add(0x20) as *mut u64, 0); // reserved
+        *h.add(0x28) = 0x01; // device entry: type 0x01 "All devices" (4 B)
+        let buf = core::slice::from_raw_parts(ivrs_dest as *const u8, ivrs_total);
+        let sum: u8 = buf.iter().copied().fold(0u8, u8::wrapping_add);
+        (*hdr).checksum = 0u8.wrapping_sub(sum);
+    }
+
+    // ---- XSDT (FADT + MADT + MCFG + HPET + SSDT + SPCR + WSMT + TPM2 + IVRS) ─
     let xsdt_header_size = core::mem::size_of::<AcpiTableHeader>() as u32;
-    let xsdt_total = xsdt_header_size + (8 * 8); // 8 × 64-bit pointers
+    let xsdt_total = xsdt_header_size + (9 * 8); // 9 × 64-bit pointers
     let xsdt_ptr = xsdt_dest as *mut AcpiTableHeader;
     unsafe {
         (*xsdt_ptr).signature = *b"XSDT";
@@ -866,6 +930,7 @@ pub unsafe fn build_at(host_dest: u64, guest_base: u64, n_vcpus: usize) -> Acpi 
         entries.add(5).write_unaligned(spcr_phys);
         entries.add(6).write_unaligned(wsmt_phys);
         entries.add(7).write_unaligned(tpm2_phys);
+        entries.add(8).write_unaligned(ivrs_phys);
         let buf = core::slice::from_raw_parts(xsdt_dest as *const u8, xsdt_total as usize);
         let sum: u8 = buf.iter().copied().fold(0u8, u8::wrapping_add);
         (*xsdt_ptr).checksum = 0u8.wrapping_sub(sum);
@@ -904,5 +969,6 @@ pub unsafe fn build_at(host_dest: u64, guest_base: u64, n_vcpus: usize) -> Acpi 
         spcr_phys,
         wsmt_phys,
         tpm2_phys,
+        ivrs_phys,
     }
 }

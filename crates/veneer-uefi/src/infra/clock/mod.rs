@@ -38,6 +38,15 @@ fn host_hpet_counter() -> u64 {
     unsafe { read_volatile((HOST_HPET + 0xF0) as *const u64) }
 }
 
+/// Throttle-immune real-time counter (the host HPET main counter) + its Hz,
+/// for diagnostics that must measure true wall-clock through a host-TSC
+/// busy-spin throttle (e.g. the HLT idle spin). `host_hpet_hz()` is 0 until
+/// the clock is anchored.
+#[inline]
+pub fn host_hpet_now() -> u64 { host_hpet_counter() }
+#[inline]
+pub fn host_hpet_hz() -> u64 { HPET_HZ.load(Ordering::Relaxed) }
+
 // ── Real-time anchor (disciplined to the host HPET) ──────────────────
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static HPET_HZ: AtomicU64 = AtomicU64::new(0);

@@ -348,7 +348,25 @@ fn sata_msi_write(reg: u8, val: u32, _width: u8) {
     }
     let ctrl = SATA_MSI_CTRL.load(Ordering::Relaxed);
     let enabled = ctrl & 0x1 != 0;
-    let vector = SATA_MSI_DATA.load(Ordering::Relaxed) & 0xFF;
+    // With IOMMU interrupt remapping active (x2APIC path) the MSI data field is
+    // an IR-table index, not the literal vector — resolve the real vector through
+    // the IRTE (same DTE→IRT→IRTE walk the IO-APIC clock uses). Without this the
+    // index (a small number) parks as sub-16 and the AHCI completion IRQ never
+    // fires, so Setup stalls waiting on disk I/O.
+    let data = SATA_MSI_DATA.load(Ordering::Relaxed) & 0xFF;
+    let ir = crate::hardware::devices::iommu::ir_active();
+    let vector = if ir {
+        crate::hardware::devices::iommu::remap_vector(data as u8).map(|v| v as u32).unwrap_or(0)
+    } else {
+        data
+    };
+    if enabled {
+        crate::sprintln!(
+            "[ahci-msi] en={} ir={} data=0x{:X} addr=0x{:X}_{:08X} -> vec=0x{:X}",
+            enabled, ir, data,
+            SATA_MSI_ADDR_HI.load(Ordering::Relaxed), SATA_MSI_ADDR_LO.load(Ordering::Relaxed), vector
+        );
+    }
     ahci::set_msi(vector, enabled);
 }
 

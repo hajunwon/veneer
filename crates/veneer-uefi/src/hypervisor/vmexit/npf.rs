@@ -26,6 +26,7 @@ use crate::hypervisor::svm::vmcb::Vmcb;
 use crate::hardware::devices::storage::{ahci, nvme};
 use crate::hardware::devices::irq::{hpet, ioapic, lapic};
 use crate::hardware::devices::bus::{nic, vga, xhci};
+use crate::hardware::devices::iommu;
 use crate::hardware::devices::tpm;
 use super::{decode, Action};
 
@@ -48,6 +49,34 @@ static NPF_DECODE_FAIL: AtomicU64 = AtomicU64::new(0);
 static SPIN_NPF_COUNT: AtomicU64 = AtomicU64::new(0);
 static SPIN_RD_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// ── NPF region histogram (temporary) ──
+// Which device region the kernel-phase NPF storm actually hits (the firmware-
+// gated [npf-spin] only samples RIP 0x7E-0x80). HPET should read ~0 now that
+// its MMIO is a writable shadow.
+#[allow(clippy::declare_interior_mutable_const)]
+const NRZ: AtomicU64 = AtomicU64::new(0);
+static NPF_REG: [AtomicU64; 12] = [NRZ; 12];
+fn npf_reg_prof(gpa: u64) {
+    let i = match TrapRegion::for_gpa(gpa) {
+        Some(TrapRegion::Lapic) => 0, Some(TrapRegion::Nvme) => 1, Some(TrapRegion::Ahci) => 2,
+        Some(TrapRegion::Hpet) => 3, Some(TrapRegion::IoApic) => 4, Some(TrapRegion::Ecam) => 5,
+        Some(TrapRegion::Xhci) => 6, Some(TrapRegion::Nic) => 7, Some(TrapRegion::Vga) => 8,
+        Some(TrapRegion::Tpm) => 9, Some(TrapRegion::Iommu) => 10, None => 11,
+    };
+    let n = NPF_REG[i].fetch_add(1, Ordering::Relaxed) + 1;
+    let total: u64 = NPF_REG.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+    if total % 50_000 == 0 {
+        crate::sprintln!(
+            "[npf-reg] lapic={} nvme={} ahci={} hpet={} ioapic={} ecam={} xhci={} nic={} vga={} tpm={} iommu={} unmapped={}",
+            NPF_REG[0].load(Ordering::Relaxed), NPF_REG[1].load(Ordering::Relaxed), NPF_REG[2].load(Ordering::Relaxed),
+            NPF_REG[3].load(Ordering::Relaxed), NPF_REG[4].load(Ordering::Relaxed), NPF_REG[5].load(Ordering::Relaxed),
+            NPF_REG[6].load(Ordering::Relaxed), NPF_REG[7].load(Ordering::Relaxed), NPF_REG[8].load(Ordering::Relaxed),
+            NPF_REG[9].load(Ordering::Relaxed), NPF_REG[10].load(Ordering::Relaxed), NPF_REG[11].load(Ordering::Relaxed),
+        );
+    }
+    let _ = n;
+}
+
 fn region_name(gpa: u64) -> &'static str {
     match TrapRegion::for_gpa(gpa) {
         Some(TrapRegion::Lapic) => "lapic",
@@ -60,6 +89,7 @@ fn region_name(gpa: u64) -> &'static str {
         Some(TrapRegion::Ahci) => "ahci",
         Some(TrapRegion::Vga) => "vga",
         Some(TrapRegion::Ecam) => "ecam",
+        Some(TrapRegion::Iommu) => "iommu",
         None => "UNMAPPED",
     }
 }
@@ -69,6 +99,7 @@ pub unsafe fn handle(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
     let gpa   = { c.exit_info_2 };
     let info1 = { c.exit_info_1 };
     let rip   = unsafe { (*vmcb).state.rip };
+    npf_reg_prof(gpa);
 
     // Stealth exec-hook: instruction-fetch fault on an armed hook page is
     // captured + resumed here. No-op (falls through) when no hooks are armed.
@@ -322,6 +353,7 @@ enum TrapRegion {
     Ahci,
     Vga,
     Ecam,
+    Iommu,
 }
 
 impl TrapRegion {
@@ -335,6 +367,7 @@ impl TrapRegion {
         if xhci::covers(gpa) { return Some(Self::Xhci); }
         if ahci::covers(gpa) { return Some(Self::Ahci); }
         if vga::mmio_covers(gpa) { return Some(Self::Vga); }
+        if iommu::covers(gpa) { return Some(Self::Iommu); }
         if crate::hardware::devices::bus::pci::covers_ecam(gpa) { return Some(Self::Ecam); }
         None
     }
@@ -350,6 +383,7 @@ impl TrapRegion {
             Self::Xhci   => xhci::read_register_width((gpa - xhci::base()) as u32, width),
             Self::Ahci   => ahci::read_register_width((gpa - ahci::base()) as u32, width),
             Self::Vga    => vga::mmio_read(gpa, width),
+            Self::Iommu  => iommu::read_register_width((gpa - iommu::IOMMU_MMIO_BASE) as u32, width),
             Self::Ecam   => crate::hardware::devices::bus::pci::ecam_read(gpa, width),
         }
     }
@@ -365,6 +399,7 @@ impl TrapRegion {
             Self::Xhci   => xhci::write_register_width((gpa - xhci::base()) as u32, val, width),
             Self::Ahci   => ahci::write_register_width((gpa - ahci::base()) as u32, val, width),
             Self::Vga    => vga::mmio_write(gpa, val, width),
+            Self::Iommu  => iommu::write_register_width((gpa - iommu::IOMMU_MMIO_BASE) as u32, val, width),
             Self::Ecam   => crate::hardware::devices::bus::pci::ecam_write(gpa, val, width),
         }
     }

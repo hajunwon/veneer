@@ -69,6 +69,16 @@ pub fn redirection(gsi: usize) -> Option<(u8, bool)> {
     Some((vector, masked))
 }
 
+/// Raw 64-bit redirection-table entry for `gsi` (diagnostics / interrupt-remap
+/// decode — the remappable format hides the vector in an IR-table index, so the
+/// caller needs the full RTE not just the legacy (vector,masked) view).
+pub fn raw_rte(gsi: usize) -> u64 {
+    if gsi >= N_REDIR_ENTRIES {
+        return 0;
+    }
+    REDIR[gsi].load(Ordering::Relaxed)
+}
+
 /// Is GSI `gsi` programmed level-triggered (RTE bit 15)?
 pub fn is_level(gsi: usize) -> bool {
     if gsi >= N_REDIR_ENTRIES {

@@ -287,6 +287,12 @@ pub unsafe fn handle(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
         // advertising it lets Windows arm the clock via MSR 0x6E0 (a cheap
         // WRMSR) and check it via native RDTSC — no HPET MMIO.
         ecx |= 1u32 << 24;
+        // ECX bit 21 = x2APIC. Force it on so Windows (seeing the type-9 x2APIC
+        // MADT entries) enables x2APIC mode and drives the LAPIC via MSRs
+        // (handled in msr.rs) instead of trapped MMIO — each xAPIC MMIO access
+        // is an NPF #VMEXIT (~155 µs nested), and the per-tick EOI/IPI traffic
+        // dominates the awake boot time.
+        ecx |= 1u32 << 21;
         // Paravirt override flips both flags atomically — Linux only
         // probes 0x40000000+ when the hypervisor-present bit is set
         // on leaf 1, so hiding the bit while publishing the signature

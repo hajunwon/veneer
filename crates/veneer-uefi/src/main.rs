@@ -535,6 +535,15 @@ fn run_guest(
         ),
         Err(_) => sprintln!("[npt ] xHCI trap install failed"),
     }
+    match npt::install_trap_range(&npt_root, devices::iommu::IOMMU_MMIO_BASE, devices::iommu::IOMMU_MMIO_SIZE) {
+        Ok(_) => sprintln!(
+            "[npt ] trapped IOMMU MMIO 0x{:016X}..0x{:016X} ({} KiB)",
+            devices::iommu::IOMMU_MMIO_BASE,
+            devices::iommu::IOMMU_MMIO_BASE + devices::iommu::IOMMU_MMIO_SIZE,
+            devices::iommu::IOMMU_MMIO_SIZE / 1024
+        ),
+        Err(_) => sprintln!("[npt ] IOMMU trap install failed"),
+    }
     devices::tpm::init();
     sprintln!("[tpm ] CRB + cmd processor ready (AMD fTPM identity, EK cert at NV 0x01C00002)");
 
@@ -1129,6 +1138,9 @@ fn enter_ovmf_guest(
         Ok(r) => r,
         Err(e) => { sprintln!("[ovmf-guest] NPT build failed: {:?}", e); return; }
     };
+    // Publish the NPT root to the exec-hook engine (needed by the delay-probe
+    // diagnostic; build_translated paths previously skipped this — TODO §2).
+    crate::introspect::hook::set_npt(&npt_root);
     match npt::map_range(&npt_root, OVMF_WINDOW_BASE, ovmf_host, OVMF_WINDOW_SIZE) {
         Ok(_) => sprintln!("[ovmf-guest] NPT: guest [0x{:08X},0x100000000) -> OVMF block", OVMF_WINDOW_BASE),
         Err(e) => { sprintln!("[ovmf-guest] OVMF NPT map failed: {:?}", e); return; }
@@ -1500,8 +1512,10 @@ fn linux_vmrun_loop(vmcb_phys: u64, host_ext_save_pa: u64, vmcb_ptr: *mut vmcb::
         if iters & 0x3FF == 0 {
             devices::i8042::poll_host_input();
         }
-        // Pump the COM2 <-> WinDbg KD bridge often so the debugger handshake /
-        // break-in stays responsive. Cheap when idle (a couple of port reads).
+        // Pump the COM2 <-> WinDbg KD bridge. Sparse cadence is fine while KD is
+        // off (the common case); raise to every-iteration only when actively
+        // attaching WinDbg (the physical 16-byte RX FIFO overflows on handshake
+        // bursts otherwise).
         if iters & 0xFF == 0 {
             crate::diag::serial_kd::bridge();
         }

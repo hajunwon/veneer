@@ -31,6 +31,7 @@ use crate::hypervisor::svm::vmcb::{vintr, Vmcb, VmcbControl};
 
 use crate::hardware::devices::storage::{ahci, nvme};
 use crate::hardware::devices::i8042;
+use crate::hardware::devices::iommu;
 use super::{hpet, ioapic, lapic, pic, pit, rtc};
 
 /// AMD event_inj type field encodings. Only NMI is delivered via event_inj
@@ -285,6 +286,18 @@ fn irq0_vector() -> Option<u8> {
 /// IO-APIC redirection table and falling back to the 8259 for the ISA
 /// lines (GSI 0..15 map 1:1 to legacy IRQs save the IRQ0→GSI2 override).
 fn gsi_vector(gsi: u32) -> Option<u8> {
+    // x2APIC path: with the IOMMU's interrupt remapping active, the IO-APIC RTE
+    // "vector" field is an IR-table index, not a literal vector. Resolve the real
+    // vector through the IRTE (DTE → IR table → IRTE). A masked RTE isn't
+    // delivered, and there is no 8259 fallback once IR is on.
+    if iommu::ir_active() {
+        let rte = ioapic::raw_rte(gsi as usize);
+        if rte & (1 << 16) != 0 {
+            return None; // masked
+        }
+        return iommu::remap_vector((rte & 0xFF) as u8).filter(|&v| v >= 16);
+    }
+    // Legacy (xAPIC) path: the RTE field holds the literal vector.
     if let Some((vector, masked)) = ioapic::redirection(gsi as usize) {
         if !masked && vector >= 16 {
             return Some(vector);

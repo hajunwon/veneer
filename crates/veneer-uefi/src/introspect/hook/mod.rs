@@ -39,6 +39,69 @@ const EXCP_DB: u32 = 1 << 1; // intercept_exceptions bit for #DB (vector 1)
 static HOOK_PAGE: [AtomicU64; MAX_HOOKS] = [const { AtomicU64::new(0) }; MAX_HOOKS];
 static HOOK_HITS: [AtomicU64; MAX_HOOKS] = [const { AtomicU64::new(0) }; MAX_HOOKS];
 
+// ── Delay/stall diagnostic probe ──
+// Per-slot exact function-entry GVA + kind (0 = plain exec hook). On a hit AT
+// the entry we log the requested duration + caller (who timed-waits and how
+// long), to diagnose the ~80%-idle boot. The page-granular NX trap also faults
+// the entry's page-mates; the rip==entry check filters to the probed function.
+static HOOK_ENTRY: [AtomicU64; MAX_HOOKS] = [const { AtomicU64::new(0) }; MAX_HOOKS];
+static HOOK_KIND: [AtomicU64; MAX_HOOKS] = [const { AtomicU64::new(0) }; MAX_HOOKS];
+static DELAY_NT_BASE: AtomicU64 = AtomicU64::new(0);
+static DELAY_LOG: AtomicU64 = AtomicU64::new(0);
+const KIND_DELAY: u64 = 1;
+
+/// Arm an exec-probe on KeDelayExecutionThread so each timed sleep logs its
+/// interval + caller. `nt_base` = ntoskrnl image base (ASLR); `cr3` any guest
+/// CR3 (kernel is global). Idempotent; armed once the base is known.
+pub fn arm_delay_probes(nt_base: u64, cr3: u64) {
+    use core::sync::atomic::AtomicBool;
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    if ARMED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    DELAY_NT_BASE.store(nt_base, Ordering::Relaxed);
+    let root = match active_npt() { Some(r) => r, None => return };
+    // KeDelayExecutionThread RVA (tiny11 26100.8036).
+    let gva = nt_base.wrapping_add(0x33_BC60);
+    let gpa = match crate::introspect::translate::gva_to_gpa(cr3, gva) {
+        Some(g) => g,
+        None => { crate::sprintln!("[delay-probe] gva_to_gpa failed for 0x{:X}", gva); return; }
+    };
+    let page = gpa & PAGE_MASK;
+    for (i, slot) in HOOK_PAGE.iter().enumerate() {
+        if slot.compare_exchange(0, page, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            if npt::arm_exec_trap(&root, page).is_ok() {
+                HOOK_ENTRY[i].store(gva, Ordering::Relaxed);
+                HOOK_KIND[i].store(KIND_DELAY, Ordering::Relaxed);
+                HOOK_HITS[i].store(0, Ordering::Relaxed);
+                crate::sprintln!("[delay-probe] armed KeDelayExecutionThread gva=0x{:X} gpa=0x{:X}", gva, gpa);
+            } else {
+                slot.store(0, Ordering::Release);
+            }
+            return;
+        }
+    }
+}
+
+/// Capture a delay-probe hit: log the requested sleep interval + the caller.
+unsafe fn probe_capture(vmcb: *mut Vmcb, gprs: &GuestGprs, _kind: u64) {
+    let cr3 = unsafe { (*vmcb).state.cr3 };
+    let rsp = unsafe { (*vmcb).state.rsp };
+    let nt = DELAY_NT_BASE.load(Ordering::Relaxed);
+    let caller = crate::introspect::mem::read_u64(cr3, rsp).unwrap_or(0);
+    let n = DELAY_LOG.fetch_add(1, Ordering::Relaxed);
+    if n < 80 || n % 200 == 0 {
+        // KeDelayExecutionThread(WaitMode=RCX, Alertable=RDX, Interval=R8 ptr).
+        // Interval is signed 100 ns units; negative = relative delay.
+        let interval = crate::introspect::mem::read_u64(cr3, gprs.r8).unwrap_or(0) as i64;
+        let ms = (if interval < 0 { -interval } else { interval }) / 10_000;
+        crate::sprintln!(
+            "[delay] #{} {}ms (raw {:#X}) caller=base+0x{:X} (0x{:X})",
+            n, ms, interval, caller.wrapping_sub(nt), caller
+        );
+    }
+}
+
 // Page disarmed for an in-flight single-step, to re-arm on the next #DB.
 // 0 = no step pending. Single vCPU → at most one pending at a time.
 static PENDING_REARM: AtomicU64 = AtomicU64::new(0);
@@ -130,13 +193,21 @@ pub unsafe fn dispatch(vmcb: *mut Vmcb, gpa: u64, info1: u64, rip: u64, gprs: &G
     for (i, slot) in HOOK_PAGE.iter().enumerate() {
         if slot.load(Ordering::Relaxed) == page {
             let n = HOOK_HITS[i].fetch_add(1, Ordering::Relaxed);
-            let mut code = [0u8; 16];
-            let got = crate::introspect::read_phys(gpa, &mut code);
-            crate::sprintln!("[hook] exec page=0x{:X} gpa=0x{:X} rip=0x{:X} #{}", page, gpa, rip, n);
-            if got {
-                crate::sprintln!("[hook]   code={:02X?}", code);
+            let entry = HOOK_ENTRY[i].load(Ordering::Relaxed);
+            if entry != 0 {
+                // Probe page: capture only at the exact function entry (page-
+                // mates fault too but aren't the probed function).
+                if rip == entry {
+                    unsafe { probe_capture(vmcb, gprs, HOOK_KIND[i].load(Ordering::Relaxed)); }
+                }
+            } else {
+                let mut code = [0u8; 16];
+                let got = crate::introspect::read_phys(gpa, &mut code);
+                crate::sprintln!("[hook] exec page=0x{:X} gpa=0x{:X} rip=0x{:X} #{}", page, gpa, rip, n);
+                if got {
+                    crate::sprintln!("[hook]   code={:02X?}", code);
+                }
             }
-            let _ = gprs; // TODO: decode calling convention, capture args.
             // Single-step setup: disarm (instruction runs), set TF, and
             // intercept #DB transiently — only until on_single_step re-arms.
             let _ = npt::disarm_exec_trap(&root, gpa);
