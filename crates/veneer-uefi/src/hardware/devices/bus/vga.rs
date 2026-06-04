@@ -215,10 +215,12 @@ pub fn blit() {
         return; // only 32bpp is wired
     }
 
-    // ~30 fps throttle using the raw host TSC (cheap, monotonic enough here).
+    // 60 fps throttle using the raw host TSC (cheap, monotonic enough here).
+    // The guest FB is BGR like the host GOP, so the copy below is a plain
+    // per-row memcpy (~0.5 ms at 1024×768×4) — 60 fps costs ~3% of the loop.
     let now = host_rdtsc();
     let last = LAST_BLIT_TSC.load(Ordering::Relaxed);
-    let min_interval = crate::infra::clock::tsc_freq::host_tsc_freq() / 30;
+    let min_interval = crate::infra::clock::tsc_freq::host_tsc_freq() / 60;
     if last != 0 && now.wrapping_sub(last) < min_interval {
         return;
     }

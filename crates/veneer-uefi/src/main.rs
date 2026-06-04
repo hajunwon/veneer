@@ -1527,8 +1527,13 @@ fn linux_vmrun_loop(vmcb_phys: u64, host_ext_save_pa: u64, vmcb_ptr: *mut vmcb::
         if iters & 0xFF == 0 {
             devices::i8042::auto_boot_key_tick();
         }
-        // Framebuffer blit is heavier; keep it at the coarse cadence.
-        if iters & 0x3FFF == 0 {
+        // Framebuffer blit. blit() self-throttles to 60 fps internally (host
+        // TSC), so the cheap early-return runs most calls and the actual copy
+        // fires ≤60/s. The old 0x3FFF iters gate throttled the *call* instead:
+        // once RDTSC went native the loop dropped to ~2 kHz, so blit was reached
+        // ~0.1×/s = a frame every ~8 s. Call it on a fine gate and let the TSC
+        // throttle govern the real frame rate.
+        if iters & 0x3 == 0 {
             devices::bus::vga::blit();
         }
 
