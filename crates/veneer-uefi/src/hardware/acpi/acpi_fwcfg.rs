@@ -104,8 +104,8 @@ unsafe fn put_name(dst: *mut u8, name: &[u8]) {
     unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), dst, n) };
 }
 
-fn alloc_page() -> Option<u64> {
-    boot::allocate_pages(AllocateType::AnyPages, MemoryType::RUNTIME_SERVICES_DATA, 1)
+fn alloc_pages(n: usize) -> Option<u64> {
+    boot::allocate_pages(AllocateType::AnyPages, MemoryType::RUNTIME_SERVICES_DATA, n)
         .ok()
         .map(|p| p.as_ptr() as u64)
 }
@@ -122,15 +122,17 @@ unsafe fn zero_byte(page: u64, off: usize) {
 /// Build the three blobs and hand them to the fw_cfg emulator. After this
 /// the OVMF guest reads ACPI through fw_cfg instead of finding none.
 pub fn build_and_stage(n_vcpus: usize) {
-    let tables = match alloc_page() {
+    // The tables blob holds the full table set (fixed tables + DSDT/SSDT
+    // namespace), so it spans the same multi-page region build_at lays out.
+    let tables = match alloc_pages(acpi::ACPI_PAGES) {
         Some(p) => p,
         None => { sprintln!("[acpi-fw] tables page alloc failed"); return; }
     };
-    let rsdp = match alloc_page() {
+    let rsdp = match alloc_pages(1) {
         Some(p) => p,
         None => { sprintln!("[acpi-fw] rsdp page alloc failed"); return; }
     };
-    let loader_page = match alloc_page() {
+    let loader_page = match alloc_pages(1) {
         Some(p) => p,
         None => { sprintln!("[acpi-fw] loader page alloc failed"); return; }
     };
@@ -152,8 +154,8 @@ pub fn build_and_stage(n_vcpus: usize) {
     let ivrs = a.ivrs_phys as usize;
     // FACS has no header/checksum and isn't in the XSDT; FADT points to it.
     let facs = a.facs_phys as usize;
-    // Blob length = the furthest table end. DSDT sits past TPM2 (it needs the
-    // 2 KiB page tail for _CRS/_PRT), so don't assume TPM2 is last.
+    // Blob length = the furthest table end. build_at bump-allocates the
+    // tables sequentially, so take the max rather than assuming an order.
     let tables_len = [xsdt, fadt, madt, mcfg, hpet, dsdt, ssdt, facs, spcr, wsmt, tpm2, ivrs]
         .iter()
         .map(|&off| off + unsafe { table_len(tables, off) } as usize)

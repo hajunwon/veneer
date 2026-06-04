@@ -21,10 +21,15 @@ const NAME_OP: u8 = 0x08;
 const BYTE_PREFIX: u8 = 0x0A;
 const WORD_PREFIX: u8 = 0x0B;
 const DWORD_PREFIX: u8 = 0x0C;
+const STRING_PREFIX: u8 = 0x0D;
 const QWORD_PREFIX: u8 = 0x0E;
 const SCOPE_OP: u8 = 0x10;
 const BUFFER_OP: u8 = 0x11;
 const PACKAGE_OP: u8 = 0x12;
+const METHOD_OP: u8 = 0x14;
+const STORE_OP: u8 = 0x70;
+const RETURN_OP: u8 = 0xA4;
+const ARG0_OP: u8 = 0x68; // Arg0..Arg6 = 0x68..0x6E
 const EXT_OP_PREFIX: u8 = 0x5B;
 const DEVICE_OP: u8 = 0x82;
 
@@ -236,4 +241,80 @@ pub fn resource_template(mut descriptors: Vec<u8>) -> Vec<u8> {
     descriptors.push(0x79); // EndTag
     descriptors.push(0x00); // checksum 0 = "do not verify"
     buffer(descriptors)
+}
+
+/// ASCII string object (`AmlString`): prefix + bytes + NUL terminator.
+/// Used for string-form `_HID`s such as the processor id "ACPI0007".
+pub fn string(s: &str) -> Vec<u8> {
+    let mut o = vec![STRING_PREFIX];
+    o.extend_from_slice(s.as_bytes());
+    o.push(0x00);
+    o
+}
+
+// ───── Small/large resource descriptors for leaf-device _CRS ─────────
+//
+// The address-space descriptors above (0x87/0x88) are the *producer*
+// windows a bridge hands to its children. Leaf devices (keyboard, RTC,
+// HPET, …) instead consume fixed I/O ports, IRQ lines, and fixed MMIO,
+// which use these smaller descriptors.
+
+/// Fixed I/O port range descriptor (small tag 0x47), 16-bit decode.
+/// `base`..`base+len-1`, with the given alignment.
+pub fn io(base: u16, len: u8, align: u8) -> Vec<u8> {
+    vec![
+        0x47, 0x01, // 16-bit decode
+        base as u8, (base >> 8) as u8, // min
+        base as u8, (base >> 8) as u8, // max (== min for a fixed port)
+        align, len,
+    ]
+}
+
+/// IRQ descriptor (small tag 0x22) carrying a single ISA IRQ line.
+/// `IRQNoFlags(){n}` — the 2-byte form real firmware uses for edge,
+/// active-high ISA interrupts.
+pub fn irq(line: u8) -> Vec<u8> {
+    let mask: u16 = 1u16 << line;
+    vec![0x22, mask as u8, (mask >> 8) as u8]
+}
+
+/// 32-bit fixed memory range descriptor (large tag 0x86). `writable`
+/// sets the read/write bit (cleared = read-only).
+pub fn memory32_fixed(base: u32, len: u32, writable: bool) -> Vec<u8> {
+    let mut o = vec![0x86, 0x09, 0x00, writable as u8];
+    o.extend_from_slice(&base.to_le_bytes());
+    o.extend_from_slice(&len.to_le_bytes());
+    o
+}
+
+// ───── Control-method bytecode (for _PIC, _OSC, …) ───────────────────
+
+/// `ArgN` operand (0..=6).
+pub fn arg(n: u8) -> Vec<u8> {
+    vec![ARG0_OP + n]
+}
+
+/// `Store (src, dstName)` — copy a term into a named object.
+pub fn store(src: Vec<u8>, dst: &str) -> Vec<u8> {
+    let mut o = vec![STORE_OP];
+    o.extend(src);
+    o.extend(name_path(dst));
+    o
+}
+
+/// `Return (value)`.
+pub fn ret(value: Vec<u8>) -> Vec<u8> {
+    let mut o = vec![RETURN_OP];
+    o.extend(value);
+    o
+}
+
+/// `Method (path, arg_count) { body }`. MethodFlags low 3 bits = arg
+/// count, bit 3 = serialized.
+pub fn method(path: &str, arg_count: u8, serialized: bool, body: Vec<u8>) -> Vec<u8> {
+    let flags = (arg_count & 0x07) | ((serialized as u8) << 3);
+    let mut b = name_path(path);
+    b.push(flags);
+    b.extend(body);
+    with_pkg(&[METHOD_OP], b)
 }

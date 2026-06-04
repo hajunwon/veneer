@@ -12,6 +12,8 @@
 
 pub mod acpi_fwcfg;
 pub mod aml;
+pub mod dsdt;
+pub mod ssdt;
 
 extern crate alloc;
 
@@ -282,74 +284,6 @@ struct Tpm2 {
     log_area_start_address: u64,
 }
 
-/// DSDT body — built programmatically via the `aml` encoder so PkgLength
-/// and nesting stay correct as the namespace grows. Contents:
-///
-///   Scope (\_SB) {
-///     Device (PCI0) {            ; PCIe root (PNP0A08 / PNP0A03)
-///       _HID / _CID / _UID
-///       _CRS                     ; bus + IO + 32-bit MMIO producer windows
-///       _PRT                     ; INTA-D → IO-APIC GSI routing
-///     }
-///   }
-///   Name (\_S5, Package(){5,0,0,0})  ; soft-off
-///
-/// The old hand-assembled body wrongly defined `Method(_OSI)` — a method the
-/// OSPM already owns — which made ACPICA abort the table load with
-/// AE_ALREADY_EXISTS and leave _S5 unresolved. The bridge also had no _CRS,
-/// so the guest couldn't claim any device BAR window ("no compatible bridge
-/// window") and no _PRT, so PCI interrupt routing was underivable.
-fn build_dsdt_body() -> alloc::vec::Vec<u8> {
-    use crate::hardware::acpi::aml;
-    use alloc::vec;
-    use alloc::vec::Vec;
-
-    // _CRS: the resource windows the PCI root produces for its children.
-    // The 32-bit MMIO window covers the BARs OVMF assigns (0x8000_0000..)
-    // and stops below the 0xE000_0000 ECAM base.
-    let mut res = Vec::new();
-    res.extend(aml::bus_range(0x00, 0x00));
-    res.extend(aml::io_range(0x0000, 0x0CF7)); // legacy IO, below the CF8/CFC config pair
-    res.extend(aml::io_range(0x0D00, 0xFFFF)); // remaining PCI IO (includes ACPI PM 0x600)
-    res.extend(aml::mem32_range(0x8000_0000, 0xDFFF_FFFF));
-    let crs = aml::name("_CRS", aml::resource_template(res));
-
-    let mut pci0 = Vec::new();
-    pci0.extend(aml::name("_HID", aml::eisaid("PNP0A08")));
-    pci0.extend(aml::name("_CID", aml::eisaid("PNP0A03")));
-    pci0.extend(aml::name("_UID", aml::integer(0)));
-    pci0.extend(crs);
-
-    // _PRT (PCI interrupt routing). Safe to enable now that the guest TSC is
-    // the step-filtered clock::now() (see intercept/rdtsc.rs): the host-TSC
-    // jump that used to fire an RCU stall — fatal under ACPI IRQ routing — is
-    // gone, so Linux's "Using ACPI for IRQ routing" path no longer crashes.
-    const ENABLE_PRT: bool = true;
-    if ENABLE_PRT {
-        let mut entries: Vec<Vec<u8>> = Vec::new();
-        for dev in 0u32..=8 {
-            for pin in 0u32..4 {
-                let gsi = 16 + ((dev + pin) & 3);
-                entries.push(aml::package(vec![
-                    aml::integer(((dev << 16) | 0xFFFF) as u64),
-                    aml::integer(pin as u64),
-                    aml::integer(0), // source 0 → use the global system interrupt below
-                    aml::integer(gsi as u64),
-                ]));
-            }
-        }
-        pci0.extend(aml::name("_PRT", aml::package(entries)));
-    }
-
-    let mut body = Vec::new();
-    body.extend(aml::scope("\\_SB", aml::device("PCI0", pci0)));
-    body.extend(aml::name(
-        "\\_S5",
-        aml::package(vec![aml::integer(5), aml::integer(0), aml::integer(0), aml::integer(0)]),
-    ));
-    body
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct Acpi {
     pub rsdp_phys: u64,
@@ -460,14 +394,19 @@ const IO_APIC_BASE: u32 = 0xFEC0_0000;
 /// Standard Local APIC MMIO base.
 const LOCAL_APIC_BASE: u32 = 0xFEE0_0000;
 
+/// Pages backing the whole table set. The fixed tables + a full DSDT
+/// namespace + per-CPU SSDT objects total ≈3 KiB at 16 vCPUs; 4 pages
+/// (16 KiB) leaves generous headroom for the namespace to grow.
+pub const ACPI_PAGES: usize = 4;
+
 pub fn build(n_vcpus: usize) -> Result<Acpi, AcpiError> {
-    // Allocate host page, deploy in place. `host_dest == guest_base` →
-    // pointer values inside the tables equal their write targets
-    // (legacy chain-load mode).
+    // Allocate the table region, deploy in place. `host_dest == guest_base`
+    // → pointer values inside the tables equal their write targets (legacy
+    // chain-load mode).
     let page = boot::allocate_pages(
         AllocateType::AnyPages,
         MemoryType::RUNTIME_SERVICES_DATA,
-        1,
+        ACPI_PAGES,
     )
     .map_err(|_| AcpiError::AllocFailed)?;
     let base = page.as_ptr() as u64;
@@ -489,55 +428,90 @@ pub fn build(n_vcpus: usize) -> Result<Acpi, AcpiError> {
 /// — feed `rsdp_phys` directly into `boot_params.acpi_rsdp_addr`.
 ///
 /// # Safety
-/// Caller must ensure `host_dest..host_dest+4096` is owned writable memory.
+/// Caller must ensure `host_dest..host_dest + ACPI_PAGES*4096` is owned
+/// writable memory.
 pub unsafe fn build_at(host_dest: u64, guest_base: u64, n_vcpus: usize) -> Acpi {
-    // One page hosts every fixed table — sizes:
-    //   RSDP @ 0x000  (36 B)
-    //   XSDT @ 0x040  (header 36 + 8×8 entries = 100 B)
-    //   FADT @ 0x100  (276 B)
-    //   MADT @ 0x220  (44 header + 12 IOAPIC + 8×N_VCPU local APIC)
-    // Up to 16 vCPUs fit; we cap there.
-    unsafe { core::ptr::write_bytes(host_dest as *mut u8, 0u8, 4096) };
+    let zero_region = ACPI_PAGES * 4096;
+    unsafe { core::ptr::write_bytes(host_dest as *mut u8, 0u8, zero_region) };
+
+    // Build the variable-length AML bodies first so the tables that carry
+    // them can be laid out by actual size.
+    let dsdt_body = dsdt::build_body();
+    let ssdt_body = ssdt::build_body(n_vcpus);
+
+    let hdr = core::mem::size_of::<AcpiTableHeader>();
+    let n_cpu = n_vcpus.min(16);
+    let madt_len = core::mem::size_of::<Madt>()
+        + core::mem::size_of::<MadtIoApic>()
+        + core::mem::size_of::<MadtIntOverride>()
+        + n_cpu * core::mem::size_of::<MadtLocalX2Apic>();
+    let ivrs_len = 0x30 + (0x28 + 4); // IVRS header(0x30) + IVHD type 0x11 + 1 device entry
+    let mcfg_len = core::mem::size_of::<Mcfg>() + core::mem::size_of::<McfgAllocation>();
+
+    // Sequential bump layout. RSDP stays at offset 0 and XSDT at 0x40: the
+    // fw_cfg packer zeroes [0, 0x40) as the dead RSDP twin and expects the
+    // XSDT there. Every other table follows on an 8-byte boundary, sized to
+    // fit — so growing the DSDT/SSDT namespace can't collide with a neighbour
+    // the way the old fixed offsets did.
+    let align8 = |x: usize| (x + 7) & !7;
+    let mut cur = 0x40usize;
+    let off_xsdt = cur; cur += align8(hdr + field::XSDT_ENTRY_COUNT * 8);
+    let off_fadt = cur; cur += align8(core::mem::size_of::<Fadt>());
+    let off_madt = cur; cur += align8(madt_len);
+    let off_mcfg = cur; cur += align8(mcfg_len);
+    let off_hpet = cur; cur += align8(core::mem::size_of::<Hpet>());
+    let off_ssdt = cur; cur += align8(hdr + ssdt_body.len());
+    let off_spcr = cur; cur += align8(core::mem::size_of::<Spcr>());
+    let off_wsmt = cur; cur += align8(core::mem::size_of::<Wsmt>());
+    let off_tpm2 = cur; cur += align8(core::mem::size_of::<Tpm2>());
+    let off_ivrs = cur; cur += align8(ivrs_len);
+    let off_facs = cur; cur += align8(core::mem::size_of::<Facs>());
+    let off_dsdt = cur; cur += align8(hdr + dsdt_body.len());
+    // Real (release-surviving) guard: a debug_assert would compile out and let
+    // an oversized namespace silently corrupt past the region. ≤16 vCPUs use
+    // ~3 KiB of the 16 KiB region, so this never trips in practice — but if the
+    // namespace ever grows past it, fail loud rather than scribble.
+    if cur > zero_region {
+        crate::sprintln!(
+            "[acpi] FATAL: tables need {} B but only {} B allocated — raise ACPI_PAGES",
+            cur, zero_region
+        );
+        panic!("ACPI table region overflow");
+    }
 
     let rsdp_dest = host_dest;
-    let xsdt_dest = host_dest + 0x40;
-    let fadt_dest = host_dest + 0x100;
-    let madt_dest = host_dest + 0x220;
-    let mcfg_dest = host_dest + 0x300;
-    let hpet_dest = host_dest + 0x380;
-    // IVRS (AMD-Vi IOMMU) — small (~0x5C B), fits the gap between HPET (ends
-    // ~0x3B8) and SSDT (0x500).
-    let ivrs_dest = host_dest + 0x3C0;
-    // DSDT carries _CRS + _PRT now (≈0.7 KiB), too big for the old 0x100
-    // slot — give it the 2 KiB tail of the page (the other fixed tables all
-    // end before 0x700).
-    let dsdt_dest = host_dest + 0x800;
-    let ssdt_dest = host_dest + 0x500;
-    let facs_dest = host_dest + 0x540;
-    let spcr_dest = host_dest + 0x580;
-    let wsmt_dest = host_dest + 0x600;
-    let tpm2_dest = host_dest + 0x680;
+    let xsdt_dest = host_dest + off_xsdt as u64;
+    let fadt_dest = host_dest + off_fadt as u64;
+    let madt_dest = host_dest + off_madt as u64;
+    let mcfg_dest = host_dest + off_mcfg as u64;
+    let hpet_dest = host_dest + off_hpet as u64;
+    let ssdt_dest = host_dest + off_ssdt as u64;
+    let spcr_dest = host_dest + off_spcr as u64;
+    let wsmt_dest = host_dest + off_wsmt as u64;
+    let tpm2_dest = host_dest + off_tpm2 as u64;
+    let ivrs_dest = host_dest + off_ivrs as u64;
+    let facs_dest = host_dest + off_facs as u64;
+    let dsdt_dest = host_dest + off_dsdt as u64;
 
     let rsdp_phys = guest_base;
-    let xsdt_phys = guest_base + 0x40;
-    let fadt_phys = guest_base + 0x100;
-    let madt_phys = guest_base + 0x220;
-    let mcfg_phys = guest_base + 0x300;
-    let hpet_phys = guest_base + 0x380;
-    let ivrs_phys = guest_base + 0x3C0;
-    let dsdt_phys = guest_base + 0x800;
-    let ssdt_phys = guest_base + 0x500;
-    let facs_phys = guest_base + 0x540;
-    let spcr_phys = guest_base + 0x580;
-    let wsmt_phys = guest_base + 0x600;
-    let tpm2_phys = guest_base + 0x680;
+    let xsdt_phys = guest_base + off_xsdt as u64;
+    let fadt_phys = guest_base + off_fadt as u64;
+    let madt_phys = guest_base + off_madt as u64;
+    let mcfg_phys = guest_base + off_mcfg as u64;
+    let hpet_phys = guest_base + off_hpet as u64;
+    let ssdt_phys = guest_base + off_ssdt as u64;
+    let spcr_phys = guest_base + off_spcr as u64;
+    let wsmt_phys = guest_base + off_wsmt as u64;
+    let tpm2_phys = guest_base + off_tpm2 as u64;
+    let ivrs_phys = guest_base + off_ivrs as u64;
+    let facs_phys = guest_base + off_facs as u64;
+    let dsdt_phys = guest_base + off_dsdt as u64;
 
     let oem_id = current_oem_id();
     let oem_table_id = current_oem_table_id();
     let creator = current_creator_id();
 
     // ---- DSDT first (FADT will reference its physical address) ──────
-    let dsdt_body = build_dsdt_body();
     let dsdt_header_size = core::mem::size_of::<AcpiTableHeader>();
     let dsdt_total = (dsdt_header_size + dsdt_body.len()) as u32;
     let dsdt_ptr = dsdt_dest as *mut AcpiTableHeader;
@@ -759,8 +733,8 @@ pub unsafe fn build_at(host_dest: u64, guest_base: u64, n_vcpus: usize) -> Acpi 
         (*hpet_ptr).header.checksum = 0u8.wrapping_sub(sum);
     }
 
-    // ---- SSDT (empty body — extends DSDT namespace but adds no methods) ----
-    let ssdt_total = core::mem::size_of::<AcpiTableHeader>() as u32;
+    // ---- SSDT (processor objects, one ACPI0007 device per vCPU) ----
+    let ssdt_total = (hdr + ssdt_body.len()) as u32;
     let ssdt_ptr = ssdt_dest as *mut AcpiTableHeader;
     unsafe {
         (*ssdt_ptr).signature = *b"SSDT";
@@ -771,6 +745,8 @@ pub unsafe fn build_at(host_dest: u64, guest_base: u64, n_vcpus: usize) -> Acpi 
         (*ssdt_ptr).oem_revision = 1;
         (*ssdt_ptr).creator_id = creator;
         (*ssdt_ptr).creator_revision = 1;
+        let body_dst = (ssdt_dest + hdr as u64) as *mut u8;
+        core::ptr::copy_nonoverlapping(ssdt_body.as_ptr(), body_dst, ssdt_body.len());
         let buf = core::slice::from_raw_parts(ssdt_dest as *const u8, ssdt_total as usize);
         let sum: u8 = buf.iter().copied().fold(0u8, u8::wrapping_add);
         (*ssdt_ptr).checksum = 0u8.wrapping_sub(sum);
