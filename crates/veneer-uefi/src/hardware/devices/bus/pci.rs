@@ -237,6 +237,12 @@ fn config_write(bus: u8, dev: u8, func: u8, reg: u8, val: u32, width: u8) {
         sata_msi_write(reg - 0x40, val, width);
         return;
     }
+    // NVMe (dev 2) MSI capability — same: persist the guest's message so the
+    // NVMe emulator can raise completions through it.
+    if (bus, dev, func) == (0, 2, 0) && (0x40..0x50).contains(&reg) {
+        nvme_msi_write(reg - 0x40, val, width);
+        return;
+    }
     // BAR writes go through the sizing table. PciBus probes a BAR with a
     // full-dword all-ones write then reads back the length mask, so only
     // 32-bit writes participate; sub-dword BAR writes never occur during
@@ -374,6 +380,56 @@ fn sata_msi_write(reg: u8, val: u32, _width: u8) {
         );
     }
     ahci::set_msi(vector, enabled);
+}
+
+// NVMe (dev 2) MSI capability. NVMe advertises both MSI (0x40) and MSI-X
+// (0xA0); Windows drives MSI here (it never programs the MSI-X table), so we
+// must capture the message and deliver completions through it — otherwise the
+// completion IRQ never fires and stornvme retries IDENTIFY NAMESPACE forever,
+// so the disk never appears in Setup. Mirrors the AHCI MSI path above.
+static NVME_MSI_CTRL: AtomicU32 = AtomicU32::new(0x0086); // bit7 64-bit capable
+static NVME_MSI_ADDR_LO: AtomicU32 = AtomicU32::new(0);
+static NVME_MSI_ADDR_HI: AtomicU32 = AtomicU32::new(0);
+static NVME_MSI_DATA: AtomicU32 = AtomicU32::new(0);
+
+fn nvme_msi_read(reg: u8) -> u32 {
+    match reg {
+        0x00 => 0x05 | (0x50 << 8) | (NVME_MSI_CTRL.load(Ordering::Relaxed) << 16), // id | next=0x50 | ctrl
+        0x04 => NVME_MSI_ADDR_LO.load(Ordering::Relaxed),
+        0x08 => NVME_MSI_ADDR_HI.load(Ordering::Relaxed),
+        0x0C => NVME_MSI_DATA.load(Ordering::Relaxed),
+        _ => 0,
+    }
+}
+
+fn nvme_msi_write(reg: u8, val: u32, _width: u8) {
+    match reg {
+        0x00 => NVME_MSI_CTRL.store((val >> 16) & 0xFFFF, Ordering::Relaxed), // full dword: control in hi half
+        0x02 => NVME_MSI_CTRL.store(val & 0xFFFF, Ordering::Relaxed),          // 16-bit control write
+        0x04 => NVME_MSI_ADDR_LO.store(val, Ordering::Relaxed),
+        0x08 => NVME_MSI_ADDR_HI.store(val, Ordering::Relaxed),
+        0x0C => NVME_MSI_DATA.store(val & 0xFFFF, Ordering::Relaxed),
+        _ => {}
+    }
+    let ctrl = NVME_MSI_CTRL.load(Ordering::Relaxed);
+    let enabled = ctrl & 0x1 != 0;
+    // Under IOMMU interrupt remapping (x2APIC path) the MSI data field is an
+    // IR-table index, not the literal vector — resolve it through the IRTE.
+    let data = NVME_MSI_DATA.load(Ordering::Relaxed) & 0xFF;
+    let ir = crate::hardware::devices::iommu::ir_active();
+    let vector = if ir {
+        crate::hardware::devices::iommu::remap_vector(data as u8).map(|v| v as u32).unwrap_or(0)
+    } else {
+        data
+    };
+    if enabled {
+        crate::sprintln!(
+            "[nvme-msi] en={} ir={} data=0x{:X} addr=0x{:X}_{:08X} -> vec=0x{:X}",
+            enabled, ir, data,
+            NVME_MSI_ADDR_HI.load(Ordering::Relaxed), NVME_MSI_ADDR_LO.load(Ordering::Relaxed), vector
+        );
+    }
+    nvme::set_msi(vector, enabled);
 }
 
 fn bar_read(idx: usize) -> u32 {
@@ -593,7 +649,7 @@ fn nvme_read(reg: u8) -> u32 {
         0x30 => 0,
         0x34 => 0x0000_0040,
         0x3C => 0x0000_010A,
-        0x40..=0x4F => cap_msi(reg - 0x40, 0x50),
+        0x40..=0x4F => nvme_msi_read(reg - 0x40),
         0x50..=0x5F => cap_pmi(reg - 0x50, 0x60),
         0x60..=0x83 => cap_pcie(reg - 0x60, 0xA0),
         0xA0..=0xAF => cap_msix(reg - 0xA0, 0, 64, 0x2000),  // 64 vectors, table at BAR0+0x2000

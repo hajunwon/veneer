@@ -175,10 +175,30 @@ fn msix_table_covers(off: u32) -> bool {
         && off < MSIX_TABLE_OFFSET + (MSIX_TABLE_ENTRIES as u32) * 16
 }
 
-/// Raise the completion interrupt for CQ interrupt-vector `iv`: stage the
-/// table entry's message data as the pending vector unless that entry is
-/// masked. The admin CQ uses IV 0.
+/// MSI completion vector (IR-decoded, set from the PCI MSI capability). 0 when
+/// MSI is disabled. When set it takes priority over the MSI-X table because
+/// Windows here drives MSI, never programming the MSI-X table.
+static MSI_VECTOR: AtomicU32 = AtomicU32::new(0);
+
+/// pci.rs: the guest (re)programmed the MSI capability. `vector` is already
+/// IR-decoded; a disabled or sub-16 vector parks delivery.
+pub fn set_msi(vector: u32, enabled: bool) {
+    MSI_VECTOR.store(if enabled && vector >= 16 { vector } else { 0 }, Ordering::Relaxed);
+}
+
+/// Raise the completion interrupt for CQ interrupt-vector `iv`. Prefers the MSI
+/// vector (the path Windows uses); falls back to the MSI-X table entry's
+/// message data if a guest drives MSI-X instead. The admin CQ uses IV 0.
 fn raise_msix(iv: u16) {
+    let msi = MSI_VECTOR.load(Ordering::Relaxed);
+    if msi != 0 {
+        let t = NVME_TRACE.fetch_add(1, Ordering::Relaxed);
+        if t < NVME_TRACE_CAP {
+            crate::sprintln!("[nvme] raise(MSI) iv={} vector=0x{:X}", iv, msi);
+        }
+        MSIX_PENDING.store(msi, Ordering::Relaxed);
+        return;
+    }
     let base = (iv as usize) * 4;
     if base + 3 >= MSIX_TABLE_ENTRIES * 4 {
         return;
@@ -545,6 +565,14 @@ fn run_identify(prp1: u64, cdw10: u32, nsid: u32) {
         _ => {} // empty buffer
     }
     let dst = g2h(prp1);
+    let t = NVME_TRACE.fetch_add(1, Ordering::Relaxed);
+    if t < NVME_TRACE_CAP {
+        let nsze = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        crate::sprintln!(
+            "[nvme-id] cns={} nsid={} prp1=0x{:X} dst_null={} present={} nsze={}",
+            cns, nsid, prp1, dst.is_null(), backend::ns_present(nsid), nsze
+        );
+    }
     if dst.is_null() { return; }
     unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, 4096); }
 }
