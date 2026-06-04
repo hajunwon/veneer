@@ -143,11 +143,26 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
     if c.vintr & vintr::V_IRQ != 0 {
         return;
     }
-    // Stage maskable interrupts only when the guest has IF set and isn't in
-    // an interrupt shadow (the boundary right after STI / MOV SS). Hardware
-    // also gates V_IRQ on guest IF, but this early-out keeps a pending IRQ in
-    // its source (and the LAPIC IRR) at IF=0 so a guest polling IRR still
-    // sees it, rather than consuming it into a deferred V_IRQ slot.
+    // Self-IPI software interrupts (Windows APC 0x1F / DPC 0x2F) are
+    // fire-and-forget: the guest requests them at raised IRQL with IF=0 and
+    // relies on the LAPIC delivering them once IRQL/IF drop. Program V_IRQ now
+    // even at guest IF=0 — under V_INTR_MASKING the CPU holds the request and
+    // delivers it autonomously the moment guest IF=1 and V_INTR_PRIO > V_TPR,
+    // with no further VMEXIT. This must run before the IF gate below: gating it
+    // on guest IF would never program V_IRQ for the common IF=0 case, the
+    // request would be dropped, and the DPC/APC dispatch would starve (the
+    // guest then re-requests in a tight self-IPI storm, never progressing).
+    if let Some(vector) = lapic::ipi_pending(0) {
+        if throttle(&IPI_INJ, 16384) { crate::sprintln!("[inject] self-ipi vec=0x{:X}", vector); }
+        raise_virq(c, vector);
+        deliver_edge(vector);
+        return;
+    }
+    // Stage the remaining maskable interrupts only when the guest has IF set
+    // and isn't in an interrupt shadow (the boundary right after STI / MOV SS).
+    // Hardware also gates V_IRQ on guest IF, but this early-out keeps a pending
+    // device IRQ in its source (and the LAPIC IRR) at IF=0 so a guest polling
+    // IRR still sees it, rather than consuming it into a deferred V_IRQ slot.
     let rflags = unsafe { (*vmcb).state.rflags };
     if rflags & (1 << 9) == 0 || c.interrupt_shadow & 1 != 0 {
         return;
@@ -254,15 +269,6 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
             // Route masked — consume so we don't re-spin the same deadline.
             None => rtc::irq8_serviced(),
         }
-    }
-    // 5. LAPIC self-IPI (ICR write to "self" / "all incl self" shorthand).
-    //    Raised as a virtual interrupt; the CPU holds it behind V_TPR so a
-    //    low-priority self-IPI can't re-enter a higher-IRQL critical section.
-    if let Some(vector) = lapic::ipi_pending(0) {
-        if throttle(&IPI_INJ, 16384) { crate::sprintln!("[inject] self-ipi vec=0x{:X}", vector); }
-        raise_virq(c, vector);
-        deliver_edge(vector);
-        return;
     }
     // Diagnostic: reached here = nothing injected this round. If the guest is
     // spinning in firmware (RIP in the OVMF range) with IF=1, no timer source
