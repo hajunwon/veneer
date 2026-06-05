@@ -203,87 +203,102 @@ fn apply_profile_field(p: &mut Profile, section: &[u8], key: &[u8], v: Value) ->
     match (section, key) {
         (b"hardware.cpu", b"brand") => {
             let s = match as_str(v) { Some(s) => s, None => return false };
-            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.cpu.brand), s); }
+            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.cpu.spec.brand), s); }
             true
         }
         (b"hardware.cpu", b"vendor") => {
             let s = match as_str(v) { Some(s) => s, None => return false };
-            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.cpu.vendor), s); }
+            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.cpu.spec.vendor), s); }
             true
         }
         (b"hardware.cpu", b"hide_hypervisor_bit") => {
             let b = match as_bool(v) { Some(b) => b, None => return false };
-            unsafe { set_bool_field(core::ptr::addr_of_mut!((*p_ptr).hardware.cpu.hide_hypervisor_bit), b); }
+            unsafe { set_bool_field(core::ptr::addr_of_mut!((*p_ptr).hardware.cpu.spec.hide_hypervisor_bit), b); }
             true
         }
         (b"hardware.cpu", b"hide_hypervisor_leaf") => {
             let b = match as_bool(v) { Some(b) => b, None => return false };
-            unsafe { set_bool_field(core::ptr::addr_of_mut!((*p_ptr).hardware.cpu.hide_hypervisor_leaf), b); }
+            unsafe { set_bool_field(core::ptr::addr_of_mut!((*p_ptr).hardware.cpu.spec.hide_hypervisor_leaf), b); }
             true
         }
         (b"hardware.cpu", b"tsc_seed") => {
             let n = match as_int(v) { Some(n) => n, None => return false };
-            unsafe { set_u64_field(core::ptr::addr_of_mut!((*p_ptr).hardware.cpu.tsc_seed), n as u64); }
+            unsafe { set_u64_field(core::ptr::addr_of_mut!((*p_ptr).hardware.cpu.spec.tsc_seed), n as u64); }
             true
         }
         (b"hardware.smbios", b"manufacturer") => {
             let s = match as_str(v) { Some(s) => s, None => return false };
-            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.smbios.manufacturer), s); }
+            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.system.spec.manufacturer), s); }
             true
         }
         (b"hardware.smbios", b"product") => {
             let s = match as_str(v) { Some(s) => s, None => return false };
-            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.smbios.product), s); }
+            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.system.spec.product), s); }
             true
         }
         (b"hardware.smbios", b"serial") => {
             let s = match as_str(v) { Some(s) => s, None => return false };
-            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.smbios.serial), s); }
+            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.system.instance.serial), s); }
             true
         }
         (b"hardware.smbios", b"version") => {
             let s = match as_str(v) { Some(s) => s, None => return false };
-            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.smbios.version), s); }
+            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.system.spec.version), s); }
             true
         }
         (b"hardware.smbios", b"uuid") => {
             let s = match as_str(v) { Some(s) => s, None => return false };
-            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.smbios.uuid), s); }
+            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.system.instance.uuid), s); }
             true
         }
         (b"hardware.smbios", b"bios_vendor") => {
             let s = match as_str(v) { Some(s) => s, None => return false };
-            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.smbios.bios_vendor), s); }
+            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.firmware.spec.bios_vendor), s); }
             true
         }
         (b"hardware.smbios", b"bios_version") => {
             let s = match as_str(v) { Some(s) => s, None => return false };
-            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.smbios.bios_version), s); }
+            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.firmware.spec.bios_version), s); }
             true
         }
         (b"hardware.smbios", b"bios_date") => {
             let s = match as_str(v) { Some(s) => s, None => return false };
-            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.smbios.bios_date), s); }
+            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.firmware.spec.bios_date), s); }
             true
         }
         (b"hardware.network", b"mac") => {
             let s = match as_str(v) { Some(s) => s, None => return false };
-            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.network.mac), s); }
+            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.network.instance.mac), s); }
             true
         }
         (b"hardware.disk", b"slot") => {
             let s = match as_str(v) { Some(s) => s, None => return false };
-            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.disk.slot), s); }
+            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.storage.spec.slot), s); }
             true
         }
         (b"hardware.disk", b"model") => {
             let s = match as_str(v) { Some(s) => s, None => return false };
-            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.disk.model), s); }
+            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.storage.spec.model), s); }
             true
         }
         (b"hardware.disk", b"serial") => {
             let s = match as_str(v) { Some(s) => s, None => return false };
-            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.disk.serial), s); }
+            unsafe { set_str_field(core::ptr::addr_of_mut!((*p_ptr).hardware.storage.instance.serial), s); }
+            true
+        }
+        (b"hardware.iommu", b"efr") => {
+            let n = match as_int(v) { Some(n) => n, None => return false };
+            unsafe { set_u64_field(core::ptr::addr_of_mut!((*p_ptr).hardware.cpu.spec.iommu.efr), n); }
+            true
+        }
+        (b"hardware.iommu", b"efr2") => {
+            let n = match as_int(v) { Some(n) => n, None => return false };
+            unsafe { set_u64_field(core::ptr::addr_of_mut!((*p_ptr).hardware.cpu.spec.iommu.efr2), n); }
+            true
+        }
+        (b"hardware.iommu", b"pci_id") => {
+            let n = match as_int(v) { Some(n) => n, None => return false };
+            unsafe { set_u32_field(core::ptr::addr_of_mut!((*p_ptr).hardware.cpu.spec.iommu.pci_id), n as u32); }
             true
         }
         (b"name", _) | (b"", b"name") => {
