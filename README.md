@@ -45,17 +45,21 @@ TPM), profile-driven identity, and the VMI + stealth-hook engine. Open work live
 
 ## Project structure
 
-A Cargo workspace of three crates, split on the `no_std` / `std` axis:
+A Cargo workspace of four crates. The hypervisor core (`veneer-vmm`) carries no
+UEFI dependency — the environment is injected through traits — so the same core
+can be driven by a UEFI app, a bare-metal loader, or a test harness:
 
 | crate | kind | role |
 |---|---|---|
-| `veneer-profile` | no_std lib | shared synthetic-PC schema + TOML parser |
-| `veneer-uefi` | no_std bin | the hypervisor (`.efi`, loaded by firmware) |
+| `veneer-profile` | no_std lib | shared synthetic-PC schema + parts catalog + TOML parser |
+| `veneer-vmm` | no_std lib | OS/firmware-agnostic VMM core (SVM, device emulation, VMI) |
+| `veneer-uefi` | no_std bin | UEFI adapter — bootstrap + host backends; loaded by firmware as `.efi` |
 | `host/veneer-probe` | std bin | host-side pre-flight (`inspect` / `plan` / `profile-check`) |
 
-`veneer-uefi` is organized into role-based layers — `infra/` → `hypervisor/` →
-`hardware/` → `guest/` → `introspect/` / `diag/` (a DAG). The full module map is
-in ARCHITECTURE.md.
+`veneer-vmm` is organized into role-based layers — `infra/` → `hypervisor/` →
+`hardware/` → `introspect/` / `diag/` (a DAG). `veneer-uefi` supplies the
+bootstrap and the host-facing adapters (`host/`). The full module map is in
+ARCHITECTURE.md.
 
 ## Requirements
 

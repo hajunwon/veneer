@@ -4,15 +4,17 @@ Open task list. Design/structure context is in [ARCHITECTURE.md](ARCHITECTURE.md
 completed work is in the git history.
 
 ## 0. Boot performance + input
-- [ ] x2APIC + interrupt remapping — finish device MSI/MSI-X delivery. Forcing
-  x2APIC (APIC-base EXTD bit) removes the LAPIC xAPIC MMIO NPF storm that
-  otherwise dominates boot, but the HAL then requires AMD-Vi interrupt
-  remapping. The IOMMU + IVRS + IR-table decode are in place and the IO-APIC
-  clock interrupt is delivered (HAL clock init no longer bugchecks 0x5C); device
-  MSI/MSI-X interrupts aren't decoded through the IRTE yet, so Setup stalls in the
-  idle loop waiting on a device wake. Extend `iommu::remap_vector` to the
-  MSI/MSI-X paths (`pci.rs` device MSI, NVMe MSI-X), resolving at injection time
-  so a late IRTE write isn't missed.
+- [ ] x2APIC vs the desktop-chiplet IOMMU — pick a consistent combination.
+  Forcing x2APIC (APIC-base EXTD bit) removes the LAPIC xAPIC MMIO NPF storm that
+  otherwise dominates boot, but the HAL then requires AMD-Vi interrupt remapping.
+  The profile advertises the CPU die's real IOMMU EFR, and desktop-chiplet dies
+  (Raphael / Vermeer) report no x2APIC interrupt remapping (XTSup clear) — so a
+  coherent desktop profile + forced x2APIC makes `HalpIommuInitSystem` return
+  NOT_SUPPORTED (bugcheck 0x5C). Either drop the x2APIC force and stay on xAPIC
+  (matches desktop-chiplet reality; then cheapen the hot LAPIC registers — next
+  item), or base the profile on a die whose IOMMU has XTSup (APU / server). The
+  x2APIC route additionally needs device MSI/MSI-X decoded through the IRTE
+  (`iommu::remap_vector` on the `pci.rs` / NVMe paths, resolved at injection time).
 - [ ] Boot-time (xAPIC path, EXTD off): early LAPIC xAPIC MMIO accesses
   (`0xFEE00xxx`: LVT timer / init-count / current-count / EOI / SVR) are each an
   NPF #VMEXIT and dominate boot wall-clock. The LAPIC can't be naively RAM-backed
@@ -56,9 +58,11 @@ completed work is in the git history.
 ## 5. Build / infra
 - [x] git init + first commit (branch `main`, 59180a9)
 - [x] `.gitignore` — `/target`, `__pycache__/`, `*.pyc`
-- [x] All warnings → 0 across all three crates
+- [x] All warnings → 0 across all crates
 - [ ] (optional) gitignore `assets/firmware/variants/` if the repo should be leaner
 
 ## 6. Fingerprints / fidelity
-- [ ] Verify `identity/profile_gen.rs` firmware revs: SN850X "620361WD", T700 "PACR5111"
+- [ ] Verify Crucial T700 fingerprints (`veneer-profile catalog/disks.rs`): Micron
+  IEEE OUI + a real firmware-rev string (capture from `nvme id-ctrl`). SN850X /
+  980 PRO controller IDs + OUIs are verified.
 - [ ] `devices/storage/ahci.rs:502` — make INQUIRY optical-drive string profile-driven

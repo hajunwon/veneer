@@ -42,7 +42,10 @@ with accurate device emulation rather than a shortcut.
 
 ## 2. Workspace structure
 
-A Cargo workspace of three crates, split on the `no_std` / `std` axis.
+A Cargo workspace of four crates. The hypervisor core is split from its UEFI
+environment: `veneer-vmm` carries no UEFI dependency and reaches the environment
+(memory, NVRAM, host I/O, console, MP) only through traits a host installs, so a
+UEFI app, a bare-metal loader, or a test harness can all drive the same core.
 
 ```
 veneer/
@@ -54,17 +57,23 @@ veneer/
 │   └── shellx64.efi                #   UEFI shell (diagnostic boot target)
 ├── tools/                          # python/ps build + boot scripts
 └── crates/
-    ├── veneer-profile/   (no_std lib)   shared Profile schema + TOML parser
-    ├── veneer-uefi/      (no_std bin)   the hypervisor (.efi)
+    ├── veneer-profile/   (no_std lib)   Profile schema + parts catalog + TOML parser
+    ├── veneer-vmm/       (no_std lib)   OS/firmware-agnostic VMM core (no UEFI dep)
+    ├── veneer-uefi/      (no_std bin)   UEFI adapter + boot orchestration (the .efi)
     └── host/veneer-probe/(std bin)      host-side pre-flight tool
 ```
 
-- **`veneer-profile`** — the single source of truth for the synthetic-PC
-  schema (`#[repr(C, packed)]`, NVRAM-layout) + the schema-driven TOML parser.
-  Used by both the hypervisor and the host tool, so they validate the exact
-  same schema.
-- **`veneer-uefi`** — the actual hypervisor, loaded by firmware as
-  `\EFI\BOOT\BOOTX64.EFI`. Everything below lives here.
+- **`veneer-profile`** — the single source of truth for the synthetic-PC schema
+  (`#[repr(C, packed)]`, NVRAM-layout) + the parts catalog (known CPUs / boards /
+  disks / dies, incl. verified per-die IOMMU values) + the schema-driven TOML
+  parser. Shared by the core and the host tool, so they validate one schema.
+- **`veneer-vmm`** — the VMM core: SVM, vmexit dispatch, device emulation,
+  introspection, identity emitters. No UEFI dependency; the host supplies memory,
+  NVRAM, host I/O backends, console, and MP services through the `platform` /
+  `HostStorage` traits.
+- **`veneer-uefi`** — the UEFI adapter: boot orchestration + the host-facing
+  backends (`host/`), loaded by firmware as `\EFI\BOOT\BOOTX64.EFI`. Implements
+  the core's environment traits over UEFI Boot/Runtime/MP Services.
 - **`veneer-probe`** — host-side utility (`inspect` / `plan` / `profile-check`).
   Runs on the real host before deploying; reads the real CPU via CPUID, picks
   the backend, validates profiles. Not a runtime layer.
@@ -78,18 +87,21 @@ cd crates/host/veneer-probe && cargo build           # → veneer.exe (inspect/p
 
 ---
 
-## 3. veneer-uefi module map
+## 3. Module map
 
-Domain folders (file = responsibility, folder = module boundary, DAG only).
+Domain folders (file = responsibility, folder = module boundary, DAG only). The
+core is `veneer-vmm`; `veneer-uefi` boots it and implements its environment
+traits. The crate boundary is the core ↔ environment line: nothing in the core
+names a UEFI symbol.
 
+**`veneer-vmm` (core, no UEFI).** DAG: infra ← {hypervisor → hardware} ←
+{introspect, diag}; `platform`/`guest_mem` are leaf primitives.
 ```
-crates/veneer-uefi/src/
-├── main.rs            UEFI entry + boot orchestration (composition root)
-│
-│  Layers are grouped by architectural ROLE. Boundary rule per bucket below;
-│  the dependency graph is a DAG: infra ← {hypervisor → hardware, guest} ←
-│  {introspect, diag}. (Where a file goes: ask which one-line rule it matches.)
-│
+crates/veneer-vmm/src/
+├── lib.rs             crate root + re-exports
+├── platform.rs        environment seam: alloc_pages / stall / MP services,
+│                      installed once by the host (Platform trait + slot)
+├── guest_mem.rs       guest-physical → host translation + guest RAM layout
 ├── infra/             "shared low-level primitive used across layers"
 │   ├── arch.rs        raw x86-64: cpuid/rdmsr/wrmsr/in/out/cr/hlt (HAL)
 │   ├── clock/         monotonic virtual TSC, host_tick, tsc_freq
@@ -101,15 +113,13 @@ crates/veneer-uefi/src/
 │   └── vmexit/        dispatch + handlers: decode, lengths, cpuid, msr, cr, dr,
 │                      dt, exception, hlt, rdtsc, vmmcall, stealth, io, npf
 ├── hardware/          "virtual hardware/tables the guest perceives"
-│   ├── devices/       irq/{lapic,ioapic,pic,pit,hpet,rtc,inject},
-│   │                  bus/{pci,xhci,vga,nic}, storage/{ahci,nvme,backend,
-│   │                  host_ahci}, iommu/{mod,command} (AMD-Vi),
-│   │                  tpm/*, (root) acpi_pm,kvmclock,fwcfg,i8042
+│   ├── devices/       registry (MmioDevice/PortDevice role traits + dispatch),
+│   │                  irq/{lapic,ioapic,pic,pit,hpet,rtc,inject},
+│   │                  bus/{pci,xhci,vga,nic}, storage/{nvme,ahci} + HostStorage
+│   │                  trait, iommu/{mod,command} (AMD-Vi), tpm/*,
+│   │                  (root) acpi_pm,kvmclock,fwcfg,i8042
 │   ├── acpi/          RSDP/XSDT/FADT/MADT/HPET/MCFG/IVRS tables, acpi_fwcfg, aml
-│   └── identity/      profile, profile_gen, smbios, nvram_io, uefi_vars, active
-├── guest/             "loads/launches the guest, manages guest RAM"
-│   └── boot/          chain_load, esp_io, guest_blob, guest_mem, linux_loader,
-│                      menu, uefi_config
+│   └── identity/      profile, profile_gen, smbios, active
 ├── introspect/        "observes/rewrites guest state from L1 (research/spoof)"
 │   ├── translate, mem VMI read/translate foundation
 │   └── hook/          stealth exec-hook engine (built on the VMI foundation)
@@ -117,6 +127,19 @@ crates/veneer-uefi/src/
                        serial_kd (WinDbg KD bridge), snapshot (guest-state +
                        bugcheck decode), thread_walk (read-only VMI census),
                        validator, report
+```
+
+**`veneer-uefi` (UEFI adapter).** Boot orchestration + the UEFI implementations
+of the core's traits.
+```
+crates/veneer-uefi/src/
+├── main.rs            UEFI entry + boot orchestration (composition root);
+│                      installs the platform + host-storage backends at startup
+├── guest/boot/        chain_load, esp_io, guest_blob, linux_loader, menu,
+│                      uefi_config  (loads/launches the guest)
+└── host/              UEFI impls of the core's traits:
+                       platform (alloc/stall/MP), input (PS/2 from host console),
+                       storage_backend + host_ahci (host disk), nvram_io, uefi_vars
 ```
 
 ---
@@ -171,7 +194,10 @@ hot registers); the LAPIC, with EOI/ICR side effects, stays trapped.
 
 ## 6. Device emulation (the synthetic PC)
 
-veneer presents a coherent fake machine. Each device class is its own module.
+veneer presents a coherent fake machine. Each device class is its own module
+behind a role trait (`MmioDevice` / `PortDevice`); the vmexit dispatcher routes a
+trapped access to the device that claims it, so adding, deepening, or swapping a
+device (emulated ↔ passthrough) is local to one module plus one registry entry.
 
 - [x] **IRQ/timers**: LAPIC, IO-APIC, 8259 PIC, 8254 PIT, HPET, RTC/CMOS,
       interrupt injection. HPET uses a **writable-shadow MMIO page** (§5) +
@@ -179,11 +205,13 @@ veneer presents a coherent fake machine. Each device class is its own module.
       it stays interrupt-capable so the HAL clock init doesn't bugcheck 0x5C.
 - [x] **Bus/IO**: PCI config space (CF8/CFC + ECAM), xHCI, VGA, NIC (BAR trap)
 - [x] **Storage**: NVMe + AHCI (MMIO BAR emulation, host-backed disk)
-- [~] **IOMMU (AMD-Vi)**: IVRS/IVHD + MMIO registers + command buffer so the
-      HAL's interrupt-remapping init succeeds (required once the guest runs
-      x2APIC). veneer decodes remappable IO-APIC/MSI entries through the guest IR
+- [~] **IOMMU (AMD-Vi)**: IVRS/IVHD + MMIO registers + command buffer, with the
+      EFR (feature register) taken from the profile's CPU die (a real per-die
+      value). veneer decodes remappable IO-APIC/MSI entries through the guest IR
       tables (Device Table → IRTE) to the real vector for injection — not a
-      functional DMA remapper (single vCPU; veneer injects directly).
+      functional DMA remapper (single vCPU; veneer injects directly). The
+      desktop-chiplet dies report no x2APIC interrupt remapping (EFR XTSup clear),
+      which the forced-x2APIC boot path needs — see TODO §0.
 - [x] **Platform**: ACPI (RSDP/XSDT/FADT/MADT/HPET/MCFG/IVRS), SMBIOS, fw_cfg,
       i8042 (PS/2 kbd), ACPI PM timer, kvmclock
 - [~] **TPM 2.0** (CRB): presence + measured boot today; full crypto planned
@@ -197,14 +225,19 @@ persisted in NVRAM).
 
 ## 7. Identity / Profile
 
-`veneer-profile` defines the `#[repr(C, packed)]` schema (CPU, SMBIOS, board,
-memory, GPU, audio, network, disk + software/OS fields). `identity/profile_gen`
-generates a profile from a policy template + RDRAND per-instance fields;
-`identity/nvram_io` + `uefi_vars` persist it across boots; `identity/active`
-holds the live Profile/Config that device emulators read.
+`veneer-profile` defines the `#[repr(C, packed)]` model, organized by component
+(CPU + on-die IOMMU, memory, system/board/firmware, GPU, audio, network, storage
++ software/OS fields). Each component separates model-class facts (`spec`, from
+the catalog) from per-unit identifiers (`instance`, generated); peripherals also
+carry a delivery mode (emulated / passthrough / absent). The parts `catalog`
+composes a profile from real parts (CPUs, boards, disks, per-die IOMMU values),
+and a `coherence` validator checks cross-surface invariants (e.g. CPU vendor ↔
+IOMMU EFR). `identity/profile_gen` fills the per-instance fields (RDRAND); the
+adapter's `nvram_io` + `uefi_vars` persist the profile across boots;
+`identity/active` holds the live Profile/Config the emitters read.
 
-The same schema + parser is reused by the host `veneer-probe` (so what it
-validates is exactly what the hypervisor consumes).
+The same schema + catalog + parser is reused by the host `veneer-probe` (so what
+it validates is exactly what the core consumes).
 
 ---
 
