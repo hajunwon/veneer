@@ -615,6 +615,17 @@ dependencies = [
  "rsa",
  "uefi",
  "veneer-profile",
+ "veneer-vmm",
+]
+
+[[package]]
+name = "veneer-vmm"
+version = "0.0.1"
+dependencies = [
+ "p256",
+ "rand_core",
+ "rsa",
+ "veneer-profile",
 ]
 
 [[package]]

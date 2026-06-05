@@ -22,10 +22,9 @@ use uefi::proto::console::text::{Color, Key, ScanCode};
 use uefi::system::{with_stdin, with_stdout};
 use uefi::print;
 
-use crate::hardware::identity::active;
-use crate::infra::config::{Config, QuickPolicy};
-use crate::hardware::identity::profile::Profile;
-use crate::sprintln;
+use veneer_vmm::hardware::identity::active;
+use veneer_vmm::infra::config::{Config, QuickPolicy};
+use veneer_vmm::hardware::identity::profile::Profile;
 
 // ───── public API ───────────────────────────────────────────────────────
 
@@ -347,9 +346,9 @@ fn draw_cached(profile: &Profile, current_policy: QuickPolicy, selected: usize) 
     // misaligned-reference UB.
     let name = unsafe { core::ptr::addr_of!(profile.name).read_unaligned() };
     let cpu = unsafe { core::ptr::addr_of!(profile.hardware.cpu).read_unaligned() };
-    let smb = unsafe { core::ptr::addr_of!(profile.hardware.smbios).read_unaligned() };
+    let smb = unsafe { core::ptr::addr_of!(profile.hardware.system).read_unaligned() };
     let net = unsafe { core::ptr::addr_of!(profile.hardware.network).read_unaligned() };
-    let disk = unsafe { core::ptr::addr_of!(profile.hardware.disk).read_unaligned() };
+    let disk = unsafe { core::ptr::addr_of!(profile.hardware.storage).read_unaligned() };
 
     at(0, ROW_BODY_START);
     color(Color::White, Color::Black);
@@ -362,14 +361,14 @@ fn draw_cached(profile: &Profile, current_policy: QuickPolicy, selected: usize) 
 
     let info_top = ROW_BODY_START + 2;
     let pairs: &[(&str, &str)] = &[
-        ("CPU",     cpu.brand.as_str()),
-        ("Vendor",  cpu.vendor.as_str()),
-        ("Vendor",  smb.manufacturer.as_str()),
-        ("Product", smb.product.as_str()),
-        ("Serial",  smb.serial.as_str()),
-        ("UUID",    smb.uuid.as_str()),
-        ("MAC",     net.mac.as_str()),
-        ("Disk",    disk.model.as_str()),
+        ("CPU",     cpu.spec.brand.as_str()),
+        ("Vendor",  cpu.spec.vendor.as_str()),
+        ("Vendor",  smb.spec.manufacturer.as_str()),
+        ("Product", smb.spec.product.as_str()),
+        ("Serial",  smb.instance.serial.as_str()),
+        ("UUID",    smb.instance.uuid.as_str()),
+        ("MAC",     net.instance.mac.as_str()),
+        ("Disk",    disk.spec.model.as_str()),
     ];
     for (i, (k, v)) in pairs.iter().enumerate() {
         at(0, info_top + i);
@@ -382,7 +381,7 @@ fn draw_cached(profile: &Profile, current_policy: QuickPolicy, selected: usize) 
     color(Color::DarkGray, Color::Black);
     print!("    {:<8} ", "Disk SN");
     color(Color::White, Color::Black);
-    print!("{}", disk.serial.as_str());
+    print!("{}", disk.instance.serial.as_str());
     reset_color();
 
     let menu_top = info_top + 11;
@@ -468,7 +467,7 @@ pub fn run(config: &Config) -> MenuChoice {
 
 // ───── advanced sub-screen ──────────────────────────────────────────────
 
-use crate::infra::config::{LogLevel, VmwareBackdoorPolicy};
+use veneer_vmm::infra::config::{LogLevel, VmwareBackdoorPolicy};
 
 /// Each row in the advanced editor — a navigable + cyclable Config slot.
 #[derive(Clone, Copy)]
@@ -684,11 +683,11 @@ pub fn run_advanced(config: &mut Config) {
                     }
                     's' | 'S' => {
                         // Persist to NVRAM and return.
-                        match crate::hardware::identity::nvram_io::save_config(config) {
+                        match crate::host::nvram_io::save_config(config) {
                             Ok(()) => sprintln!("[adv ] config saved to NVRAM"),
                             Err(e) => sprintln!("[adv ] config save failed: {:?}", e),
                         }
-                        crate::hardware::identity::active::CONFIG.set(*config);
+                        veneer_vmm::hardware::identity::active::CONFIG.set(*config);
                         return;
                     }
                     'x' | 'X' => {
@@ -696,7 +695,7 @@ pub fn run_advanced(config: &mut Config) {
                         return;
                     }
                     'r' | 'R' => {
-                        *config = crate::infra::config::DEFAULT;
+                        *config = veneer_vmm::infra::config::DEFAULT;
                         dirty = true;
                     }
                     _ => continue,

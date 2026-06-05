@@ -51,7 +51,6 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 
-use crate::sprintln;
 
 // ---- bzImage setup_header field offsets (within the bzImage file) ---------
 
@@ -97,9 +96,7 @@ pub const CMDLINE_PHYS:     u64 = 0x0009_2000;
 /// using any free conventional-memory address blindly hands us stale
 /// UEFI BootServices data on the first pop. RSP is set to the *top*
 /// of the region; stack grows down toward STACK_PHYS.
-pub const STACK_PHYS:       u64 = 0x0008_0000;
-pub const STACK_BYTES:      u64 = 0x0000_4000;  // 16 KiB
-pub const STACK_TOP:        u64 = STACK_PHYS + STACK_BYTES;
+pub use veneer_vmm::guest_mem::{STACK_BYTES, STACK_PHYS, STACK_TOP};
 
 
 /// Guest page table — 4-level identity map for guest_phys 0..1 GiB.
@@ -153,7 +150,7 @@ pub struct LoadedKernel {
 /// without a split memory map (RAM above the hole would collide with the
 /// PCI/ECAM/LAPIC MMIO at 0x80000000+); more RAM needs a high region above
 /// 4 GiB. Windows PE wants ~2 GiB, so this is the no-split maximum.
-pub const GUEST_RAM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub use veneer_vmm::guest_mem::GUEST_RAM_BYTES;
 
 /// Translate a guest-physical address inside [0, GUEST_RAM_BYTES) to
 /// the host-physical (== host-virtual under UEFI identity paging) where

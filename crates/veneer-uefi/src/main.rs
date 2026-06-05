@@ -5,27 +5,27 @@
 // intentionally defined ahead of use. Genuine dead paths are removed, not allowed.
 #![allow(dead_code)]
 
-mod infra;
-mod hypervisor;
-mod hardware;
-mod guest;
-#[allow(dead_code)]
-mod introspect;
-mod diag;
+#[macro_use]
+extern crate veneer_vmm;
 
-use crate::infra::config::toml;
-use crate::infra::{arch, config};
-use crate::hypervisor::vmexit;
-use crate::hardware::{acpi, devices};
-use crate::infra::serial;
-use crate::infra::clock::{host_tick, tsc_freq};
-use crate::infra::arch::halt_forever;
-use crate::hypervisor::svm::{self, vmcb, vmrun, npt, smp, vcpu_pool, gprs};
-use crate::hardware::identity::{profile, profile_gen, smbios, nvram_io, uefi_vars, active};
-use crate::hardware::acpi::acpi_fwcfg;
-use crate::guest::boot::{chain_load, esp_io, guest_blob, guest_mem, linux_loader, menu, uefi_config};
-use crate::diag::report::{report_profile, report_ap_probe, verify, report_vmexit, report_success, report_error};
-use crate::diag::validator;
+mod guest;
+mod host;
+
+use veneer_vmm::infra::config::toml;
+use veneer_vmm::infra::{arch, config};
+use veneer_vmm::hypervisor::vmexit;
+use veneer_vmm::hardware::{acpi, devices};
+use veneer_vmm::infra::serial;
+use veneer_vmm::infra::clock::{host_tick, tsc_freq};
+use veneer_vmm::infra::arch::halt_forever;
+use veneer_vmm::hypervisor::svm::{self, vmcb, vmrun, npt, smp, vcpu_pool, gprs};
+use veneer_vmm::hardware::identity::{profile, profile_gen, smbios, active};
+use crate::host::{nvram_io, uefi_vars};
+use veneer_vmm::hardware::acpi::acpi_fwcfg;
+use crate::guest::boot::{chain_load, esp_io, guest_blob, linux_loader, menu, uefi_config};
+use veneer_vmm::guest_mem;
+use veneer_vmm::diag::report::{report_profile, report_ap_probe, verify, report_vmexit, report_success, report_error};
+use veneer_vmm::diag::validator;
 use uefi::prelude::*;
 
 const BANNER: &str = concat!(
@@ -38,6 +38,10 @@ const BANNER: &str = concat!(
 fn main() -> Status {
     uefi::helpers::init().unwrap();
     serial::init();
+    // Install the host environment seam before any core service allocates,
+    // stalls, or touches MP — the UEFI-free core reaches the environment
+    // only through this.
+    veneer_vmm::platform::set_platform(&crate::host::platform::UEFI_PLATFORM);
 
     sprintln!();
     sprintln!("================================================================");
@@ -275,8 +279,8 @@ fn main() -> Status {
             // set, or from the legacy fallback literals otherwise.
             match active::PROFILE.get() {
                 Some(p) => {
-                    let m = unsafe { core::ptr::addr_of!(p.hardware.smbios.manufacturer).read_unaligned() };
-                    let pr = unsafe { core::ptr::addr_of!(p.hardware.smbios.product).read_unaligned() };
+                    let m = unsafe { core::ptr::addr_of!(p.hardware.system.spec.manufacturer).read_unaligned() };
+                    let pr = unsafe { core::ptr::addr_of!(p.hardware.system.spec.product).read_unaligned() };
                     sprintln!("[smb ] System: Manufacturer=\"{}\" Product=\"{}\"",
                         m.as_str(), pr.as_str());
                 }
@@ -460,7 +464,7 @@ fn run_guest(
     );
     // Publish the NPT root so the stealth exec-hook engine can arm/dispatch.
     // (The build_translated paths need the same one call when exercised.)
-    crate::introspect::hook::set_npt(&npt_root);
+    veneer_vmm::introspect::hook::set_npt(&npt_root);
 
     // Trap the Local APIC MMIO window so guest accesses route through
     // our emulator instead of touching the host LAPIC.
@@ -675,7 +679,7 @@ fn enter_linux_guest(
     );
     // Anchor the faithful clock to the host HPET (a wall-clock-reliable
     // counter here) using the just-measured host TSC frequency.
-    crate::infra::clock::init_hpet_clock(svm_mode_freq);
+    veneer_vmm::infra::clock::init_hpet_clock(svm_mode_freq);
 
     // Diagnostic: report whether the host CPU exposes the AMD SVM
     // TscRateMsr feature (CPUID 0x8000_000A.EDX bit 4). When 1, the
@@ -812,7 +816,7 @@ fn enter_linux_guest(
     devices::storage::nvme::set_host_ram_base(host_ram_base);
     // Central gpa→host translation (low region only on the Linux path).
     guest_mem::set_layout(host_ram_base, linux_loader::GUEST_RAM_BYTES, 0, 0);
-    devices::storage::backend::init();
+    crate::host::storage_backend::init();
 
     // ── 3b. Deploy ACPI tables inside guest RAM (standard hypervisor
     // pattern — KVM/QEMU/Cloud HV/Firecracker/Xen all do this). The
@@ -1059,7 +1063,7 @@ fn enter_ovmf_guest(
     sprintln!("[ovmf-guest] SVM-mode TSC: {} Hz", svm_mode_freq);
     // Anchor the faithful clock to the host HPET (a wall-clock-reliable
     // counter here) using the just-measured host TSC frequency.
-    crate::infra::clock::init_hpet_clock(svm_mode_freq);
+    veneer_vmm::infra::clock::init_hpet_clock(svm_mode_freq);
 
     // 1. Read OVMF CODE + VARS from our ESP.
     let our_image = uefi::boot::image_handle();
@@ -1131,7 +1135,7 @@ fn enter_ovmf_guest(
     devices::storage::nvme::set_host_ram_base(host_ram_base);
     devices::storage::ahci::set_host_ram_base(host_ram_base);
     vmexit::io::set_guest_ram_base(host_ram_base);
-    devices::storage::backend::init();
+    crate::host::storage_backend::init();
 
     // 5. NPT: guest 0..1 GiB -> host RAM; top 4 MiB -> OVMF block.
     let npt_root = match npt::build_translated(host_ram_base, (linux_loader::GUEST_RAM_BYTES / npt::ONE_GIB) as usize) {
@@ -1140,7 +1144,7 @@ fn enter_ovmf_guest(
     };
     // Publish the NPT root to the exec-hook engine (needed by the delay-probe
     // diagnostic; build_translated paths previously skipped this — TODO §2).
-    crate::introspect::hook::set_npt(&npt_root);
+    veneer_vmm::introspect::hook::set_npt(&npt_root);
     match npt::map_range(&npt_root, OVMF_WINDOW_BASE, ovmf_host, OVMF_WINDOW_SIZE) {
         Ok(_) => sprintln!("[ovmf-guest] NPT: guest [0x{:08X},0x100000000) -> OVMF block", OVMF_WINDOW_BASE),
         Err(e) => { sprintln!("[ovmf-guest] OVMF NPT map failed: {:?}", e); return; }
@@ -1333,7 +1337,7 @@ fn enter_ovmf_guest(
 
     // One-shot: report which host UEFI input sources VMware's OVMF exposes,
     // so the keyboard + mouse pipeline is built on confirmed protocols.
-    devices::input::probe();
+    crate::host::input::probe();
 
     // Verification for the independent-periodic-VMEXIT work (host LAPIC timer +
     // INTR intercept): dump the host APIC mode / IDT / timer state so the
@@ -1343,7 +1347,7 @@ fn enter_ovmf_guest(
     // Bring up the COM2 <-> WinDbg kernel-debug bridge (no-op if no physical
     // COM2 / VMware serial1 pipe is attached). Lets a host WinDbg attach to the
     // guest's KD transport so an early-boot bugcheck/break is fully visible.
-    crate::diag::serial_kd::host_init();
+    veneer_vmm::diag::serial_kd::host_init();
 
     // Arm the host preemption tick: a host LAPIC timer + INTR intercept forces
     // a periodic #VMEXIT even when the guest runs exit-free (native RDTSC), so
@@ -1405,7 +1409,7 @@ fn dump_host_apic_state() {
             rd(0x20), rd(0x30), rd(0xF0), rd(0x320), rd(0x380), rd(0x390), rd(0x3E0)
         );
     }
-    sprintln!("[hostapic] host_tsc_freq={} Hz", crate::infra::clock::tsc_freq::host_tsc_freq());
+    sprintln!("[hostapic] host_tsc_freq={} Hz", veneer_vmm::infra::clock::tsc_freq::host_tsc_freq());
 }
 
 
@@ -1443,7 +1447,7 @@ fn linux_vmrun_loop(vmcb_phys: u64, host_ext_save_pa: u64, vmcb_ptr: *mut vmcb::
         (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut h_rdtsc = 0u64;
     let (mut h_pause, mut h_intr) = (0u64, 0u64);
-    let mut last_report_tsc = crate::infra::clock::now();
+    let mut last_report_tsc = veneer_vmm::infra::clock::now();
     // Track the heartbeat RIP across reports so a stall (RIP frozen in a small
     // region) is visible and we can dump the code there once.
     let mut last_hb_rip: u64 = 0;
@@ -1468,7 +1472,7 @@ fn linux_vmrun_loop(vmcb_phys: u64, host_ext_save_pa: u64, vmcb_ptr: *mut vmcb::
         }
         if iters.is_multiple_of(REPORT_EVERY) {
             let rip = unsafe { (*vmcb_ptr).state.rip };
-            let now = crate::infra::clock::now();
+            let now = veneer_vmm::infra::clock::now();
             let ms = now.wrapping_sub(last_report_tsc) / (tsc_freq::host_tsc_freq() / 1000).max(1);
             let rate = if ms > 0 { REPORT_EVERY * 1000 / ms } else { 0 };
             sprintln!("[linux-guest] still running: iter={} RIP=0x{:016X} vclk=0x{:X}", iters, rip, now);
@@ -1513,13 +1517,13 @@ fn linux_vmrun_loop(vmcb_phys: u64, host_ext_save_pa: u64, vmcb_ptr: *mut vmcb::
         // iteration rate (at guest idle, exits are sparse — an iteration-count
         // gate stretched latency to seconds). Called every iteration; the pace
         // is enforced inside.
-        devices::input::poll();
+        crate::host::input::poll();
         // Pump the COM2 <-> WinDbg KD bridge. Sparse cadence is fine while KD is
         // off (the common case); raise to every-iteration only when actively
         // attaching WinDbg (the physical 16-byte RX FIFO overflows on handshake
         // bursts otherwise).
         if iters & 0xFF == 0 {
-            crate::diag::serial_kd::bridge();
+            veneer_vmm::diag::serial_kd::bridge();
         }
         // Finer cadence than host-input polling: once RDTSC is native, VMEXITs
         // (and thus iterations) are sparse (~1 kHz), so a 0x3FF gate would only
@@ -1762,7 +1766,7 @@ unsafe fn guest_va_to_phys(_host_base: u64, cr3: u64, va: u64) -> Option<u64> {
     // NOT at host_base+phys (that read crashed veneer). guest_mem::to_host knows
     // both regions.
     let rd = |phys: u64| -> Option<u64> {
-        let h = crate::guest::boot::guest_mem::to_host(phys)?;
+        let h = veneer_vmm::guest_mem::to_host(phys)?;
         Some(unsafe { core::ptr::read_unaligned(h as *const u64) })
     };
     let shifts = [39u32, 30, 21, 12];
@@ -1790,7 +1794,7 @@ unsafe fn dump_kernel_stuck(host_base: u64, cr3: u64, rip: u64, rsp: u64) {
     // Read a 48-byte code window at a guest-PHYSICAL address through the proper
     // low/high host mapping (guest_mem::to_host) — never host_base+phys, which
     // is wrong for high RAM (>4 GiB) and crashed veneer with an OOB host read.
-    let dump_at = |gpa: u64, tag: &str| match crate::guest::boot::guest_mem::to_host(gpa.saturating_sub(16)) {
+    let dump_at = |gpa: u64, tag: &str| match veneer_vmm::guest_mem::to_host(gpa.saturating_sub(16)) {
         Some(h) => {
             let mut bytes = [0u8; 48];
             unsafe { core::ptr::copy_nonoverlapping(h as *const u8, bytes.as_mut_ptr(), 48) };
@@ -1812,7 +1816,7 @@ unsafe fn dump_kernel_stuck(host_base: u64, cr3: u64, rip: u64, rsp: u64) {
         sprintln!("[stuck] kernel RSP 0x{:X} did not translate", rsp);
         return;
     };
-    let Some(rsp_h) = crate::guest::boot::guest_mem::to_host(rsp_phys) else {
+    let Some(rsp_h) = veneer_vmm::guest_mem::to_host(rsp_phys) else {
         sprintln!("[stuck] kern rsp phys 0x{:X} not in guest RAM", rsp_phys);
         return;
     };

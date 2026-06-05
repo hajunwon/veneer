@@ -10,6 +10,7 @@ license     = "MIT"
 uefi = { version = "0.32", features = ["panic_handler", "logger", "alloc", "global_allocator"] }
 log  = "0.4"
 veneer-profile = { path = "../veneer-profile" }
+veneer-vmm = { path = "../veneer-vmm" }
 
 # TPM 2.0 crypto — vetted no_std RustCrypto primitives.
 rsa = { version = "0.9", default-features = false }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members  = ["crates/veneer-profile", "crates/veneer-uefi", "crates/host/veneer-probe"]
+members  = ["crates/veneer-profile", "crates/veneer-vmm", "crates/veneer-uefi", "crates/host/veneer-probe"]
 
 [profile.release]
 opt-level = 3

@@ -9,4 +9,4 @@ pub mod cpu;
 pub mod profile;
 pub mod platform;
 
-pub use profile::{Profile, HardwareProfile};
+pub use profile::{HardwareModel, Profile};

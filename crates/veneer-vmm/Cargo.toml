@@ -1,0 +1,14 @@
+[package]
+name = "veneer-vmm"
+version = "0.0.1"
+edition = "2021"
+
+# The OS/firmware-agnostic virtual machine monitor: SVM hypervisor, vmexit
+# dispatch, virtual-device emulation, introspection. No UEFI dependency — the environment (memory,
+# NVRAM, host I/O backends, console) is supplied by the host through traits,
+# so a UEFI app, a bare-metal loader, or a test harness can all drive it.
+[dependencies]
+veneer-profile = { path = "../veneer-profile" }
+rsa = { version = "0.9", default-features = false }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh"] }
+rand_core = { version = "0.6", default-features = false }

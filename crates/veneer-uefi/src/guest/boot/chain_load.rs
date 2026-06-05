@@ -30,7 +30,6 @@ use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode, FileType
 use uefi::{cstr16, guid, Event, Guid, Handle, Status};
 use core::ptr::NonNull;
 
-use crate::sprintln;
 
 const KERNEL_PATH: &uefi::CStr16 = cstr16!("\\vmlinuz-lts");
 const INITRD_PATH: &uefi::CStr16 = cstr16!("\\initramfs-lts");
