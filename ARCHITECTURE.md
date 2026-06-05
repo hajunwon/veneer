@@ -200,18 +200,26 @@ trapped access to the device that claims it, so adding, deepening, or swapping a
 device (emulated ↔ passthrough) is local to one module plus one registry entry.
 
 - [x] **IRQ/timers**: LAPIC, IO-APIC, 8259 PIC, 8254 PIT, HPET, RTC/CMOS,
-      interrupt injection. HPET uses a **writable-shadow MMIO page** (§5) +
-      lazy `shadow_tick` reconcile to avoid the per-tick clock-arm NPF storm;
-      it stays interrupt-capable so the HAL clock init doesn't bugcheck 0x5C.
+      interrupt injection. The guest APIC mode (xAPIC vs x2APIC) follows the
+      profile die's IOMMU XTSup (`irq/apic_mode`) — desktop dies present xAPIC,
+      APU/server dies x2APIC — so the OS makes the same choice its real die
+      would. Maskable interrupts are raised as AMD V_IRQ (honouring IRQL via
+      V_TPR); the IRR→ISR transition is deferred until the CPU actually accepts
+      the interrupt, so a pending request stays visible in IRR as hardware does
+      and the xAPIC HAL's IRR poll expects. HPET uses a **writable-shadow MMIO
+      page** (§5) + lazy `shadow_tick` reconcile to avoid the per-tick clock-arm
+      NPF storm; it stays interrupt-capable so the HAL clock init doesn't
+      bugcheck 0x5C.
 - [x] **Bus/IO**: PCI config space (CF8/CFC + ECAM), xHCI, VGA, NIC (BAR trap)
 - [x] **Storage**: NVMe + AHCI (MMIO BAR emulation, host-backed disk)
 - [~] **IOMMU (AMD-Vi)**: IVRS/IVHD + MMIO registers + command buffer, with the
       EFR (feature register) taken from the profile's CPU die (a real per-die
       value). veneer decodes remappable IO-APIC/MSI entries through the guest IR
       tables (Device Table → IRTE) to the real vector for injection — not a
-      functional DMA remapper (single vCPU; veneer injects directly). The
-      desktop-chiplet dies report no x2APIC interrupt remapping (EFR XTSup clear),
-      which the forced-x2APIC boot path needs — see TODO §0.
+      functional DMA remapper (single vCPU; veneer injects directly). Desktop-
+      chiplet dies report no x2APIC interrupt remapping (EFR XTSup clear); the
+      guest APIC mode follows this (§ IRQ/timers), so a desktop profile runs
+      xAPIC and the IRTE decode applies only to x2APIC (APU/server) profiles.
 - [x] **Platform**: ACPI (RSDP/XSDT/FADT/MADT/HPET/MCFG/IVRS), SMBIOS, fw_cfg,
       i8042 (PS/2 kbd), ACPI PM timer, kvmclock
 - [~] **TPM 2.0** (CRB): presence + measured boot today; full crypto planned

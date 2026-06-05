@@ -4,22 +4,14 @@ Open task list. Design/structure context is in [ARCHITECTURE.md](ARCHITECTURE.md
 completed work is in the git history.
 
 ## 0. Boot performance + input
-- [ ] x2APIC vs the desktop-chiplet IOMMU — pick a consistent combination.
-  Forcing x2APIC (APIC-base EXTD bit) removes the LAPIC xAPIC MMIO NPF storm that
-  otherwise dominates boot, but the HAL then requires AMD-Vi interrupt remapping.
-  The profile advertises the CPU die's real IOMMU EFR, and desktop-chiplet dies
-  (Raphael / Vermeer) report no x2APIC interrupt remapping (XTSup clear) — so a
-  coherent desktop profile + forced x2APIC makes `HalpIommuInitSystem` return
-  NOT_SUPPORTED (bugcheck 0x5C). Either drop the x2APIC force and stay on xAPIC
-  (matches desktop-chiplet reality; then cheapen the hot LAPIC registers — next
-  item), or base the profile on a die whose IOMMU has XTSup (APU / server). The
-  x2APIC route additionally needs device MSI/MSI-X decoded through the IRTE
-  (`iommu::remap_vector` on the `pci.rs` / NVMe paths, resolved at injection time).
-- [ ] Boot-time (xAPIC path, EXTD off): early LAPIC xAPIC MMIO accesses
-  (`0xFEE00xxx`: LVT timer / init-count / current-count / EOI / SVR) are each an
-  NPF #VMEXIT and dominate boot wall-clock. The LAPIC can't be naively RAM-backed
-  like the HPET (EOI/ICR/timer have side effects). Option: selectively cheapen the
-  hot register(s) (likely the timer current-count 0x390 calibration read).
+- [ ] xAPIC LAPIC MMIO is the boot wall-clock cost: early accesses (`0xFEE00xxx`:
+  LVT timer / init-count / current-count / EOI / SVR) are each an NPF #VMEXIT. The
+  LAPIC can't be naively RAM-backed like the HPET (EOI/ICR/timer have side
+  effects). Option: selectively cheapen the hot register(s) (likely the timer
+  current-count 0x390 calibration read).
+- [ ] x2APIC profiles (APU / server dies, where the IOMMU has XTSup) need device
+  MSI/MSI-X decoded through the IRTE (`iommu::remap_vector` on the `pci.rs` / NVMe
+  paths, resolved at injection time). Not needed for desktop-die (xAPIC) profiles.
 - [ ] Mouse input: the guest gets keyboard (i8042 PS/2 kbd, IRQ1) but no mouse
   at all in Setup. Add the i8042 AUX port (PS/2 mouse): aux enable (0xA8) /
   write-to-aux (0xD4) / the mouse command set (reset→0xAA 0x00, 0xF4 enable,
