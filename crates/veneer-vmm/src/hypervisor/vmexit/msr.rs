@@ -220,15 +220,6 @@ const SYNTH_MTRR_DEF_TYPE: u64 = 0x0000_0000_0000_0806;
 /// per slot, packed into the 64-bit value as 8 bytes of 0x06.
 const SYNTH_MTRR_FIX_WB: u64 = 0x0606_0606_0606_0606;
 
-/// APIC base default before the guest writes it: xAPIC global enable (bit 11) +
-/// BSP (bit 8) + base 0xFEE00000.
-/// NOTE: pre-setting x2APIC EXTD (bit 10 → 0xFEE00D00) DOES make Windows enable
-/// x2APIC (LAPIC NPF 99k→0, lever proven), but the current x2APIC MSR emulation
-/// (x2apic_read/write below) is incorrect enough that the kernel bugchecks into
-/// HaliHaltSystem early. Keep EXTD off until the emulation is fixed (the IPI /
-/// self-test / register-readback path the kernel verifies). The MSR routing
-/// stays in place but dormant (the guest never touches 0x800-0x8FF in xAPIC).
-const SYNTH_APIC_BASE: u64 = 0xFEE0_0D00;
 /// IA32_MISC_ENABLE default: fast-strings (bit 0) on, everything else off.
 /// Notably limit-CPUID-maxval (bit 22) clear so the guest sees the full
 /// leaf range, and XD-disable (bit 34) clear so NX stays available.
@@ -548,7 +539,9 @@ pub unsafe fn handle_rdmsr(vmcb: *mut Vmcb, gprs: &mut GuestGprs) -> Action {
         // virtual TSC. A dropped guest write then read back the host value →
         // the guest concluded its write was lost and re-looped. Shadow hits
         // are served above; these are the pre-write defaults.
-        idx::IA32_APIC_BASE => split(SYNTH_APIC_BASE),
+        // Synth default before the guest writes it; the die's IOMMU XTSup
+        // decides xAPIC vs x2APIC (EXTD). Shadowed, so a guest write round-trips.
+        idx::IA32_APIC_BASE => split(crate::hardware::devices::irq::apic_mode::base_default()),
         idx::IA32_MISC_ENABLE => split(SYNTH_MISC_ENABLE),
         idx::IA32_TSC_ADJUST => split(0),
         idx::IA32_SPEC_CTRL | idx::IA32_PRED_CMD => split(0),

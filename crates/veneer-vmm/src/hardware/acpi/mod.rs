@@ -603,8 +603,16 @@ pub unsafe fn build_at(host_dest: u64, guest_base: u64, n_vcpus: usize) -> Acpi 
     let madt_header_size = core::mem::size_of::<Madt>();
     let ioapic_size = core::mem::size_of::<MadtIoApic>();
     let override_size = core::mem::size_of::<MadtIntOverride>();
-    // Present CPUs as x2APIC (type 9) so Windows uses the MSR APIC path.
-    let lapic_size = core::mem::size_of::<MadtLocalX2Apic>();
+    // CPU entry kind follows the die's APIC mode: x2APIC (type 9) lets Windows
+    // drive the LAPIC via cheap MSRs, but a die whose IOMMU lacks x2APIC IR
+    // (XTSup=0) must present type-0 Local APIC so the guest stays in xAPIC.
+    use crate::hardware::devices::irq::apic_mode::{mode, ApicMode};
+    let x2apic = matches!(mode(), ApicMode::X2Apic);
+    let lapic_size = if x2apic {
+        core::mem::size_of::<MadtLocalX2Apic>()
+    } else {
+        core::mem::size_of::<MadtLocalApic>()
+    };
     let madt_total = (madt_header_size + ioapic_size + override_size + n * lapic_size) as u32;
     let madt_ptr = madt_dest as *mut Madt;
     unsafe {
@@ -648,14 +656,23 @@ pub unsafe fn build_at(host_dest: u64, guest_base: u64, n_vcpus: usize) -> Acpi 
     // ceil(log2(N)) core-shift width leaf 0x80000008.ECX[15:12] reports.
     let mut lapic_off = madt_dest + (madt_header_size + ioapic_size + override_size) as u64;
     for i in 0..n {
-        let lapic_ptr = lapic_off as *mut MadtLocalX2Apic;
         unsafe {
-            (*lapic_ptr).type_ = 9; // Processor Local x2APIC
-            (*lapic_ptr).length = lapic_size as u8;
-            (*lapic_ptr).reserved = 0;
-            (*lapic_ptr).x2apic_id = i as u32;
-            (*lapic_ptr).flags = 1; // enabled
-            (*lapic_ptr).acpi_processor_uid = i as u32;
+            if x2apic {
+                let lapic_ptr = lapic_off as *mut MadtLocalX2Apic;
+                (*lapic_ptr).type_ = 9; // Processor Local x2APIC
+                (*lapic_ptr).length = lapic_size as u8;
+                (*lapic_ptr).reserved = 0;
+                (*lapic_ptr).x2apic_id = i as u32;
+                (*lapic_ptr).flags = 1; // enabled
+                (*lapic_ptr).acpi_processor_uid = i as u32;
+            } else {
+                let lapic_ptr = lapic_off as *mut MadtLocalApic;
+                (*lapic_ptr).type_ = 0; // Local APIC
+                (*lapic_ptr).length = lapic_size as u8;
+                (*lapic_ptr).acpi_processor_uid = i as u8;
+                (*lapic_ptr).apic_id = i as u8;
+                (*lapic_ptr).flags = 1; // enabled
+            }
         }
         lapic_off += lapic_size as u64;
     }

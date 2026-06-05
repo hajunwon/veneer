@@ -59,6 +59,14 @@ pub fn efr() -> u64 {
     }
 }
 
+/// XTSup (EFR bit 2): does the active die's IOMMU support x2APIC interrupt
+/// remapping? The single authority for the bit position (the profile model
+/// mirrors the same test). Desktop chiplet dies clear it; APU/server dies set
+/// it. Drives the guest APIC mode via `irq::apic_mode::mode`.
+pub fn xtsup() -> bool {
+    efr() & (1 << 2) != 0
+}
+
 // ── MMIO register backing store (single vCPU: accesses are serialized in the
 // VMEXIT handler, atomics are just for the static-mut-free pattern) ──
 static DEV_TAB_BASE: AtomicU64 = AtomicU64::new(0);
