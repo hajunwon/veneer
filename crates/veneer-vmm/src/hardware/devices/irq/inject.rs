@@ -80,24 +80,47 @@ fn raise_virq(c: &mut VmcbControl, vector: u8) {
         | ((vector as u64) << vintr::V_INTR_VECTOR_SHIFT);
 }
 
-/// Record an edge-triggered interrupt as in-service in the LAPIC ISR so
-/// PPR rises and EOI has something to clear. Used for the LAPIC timer and
-/// MSI/MSI-X completions, which have no IO-APIC line / remote-IRR.
-#[inline]
-fn deliver_edge(vector: u8) {
-    lapic::set_in_service(0, vector, false);
+/// The single V_IRQ we've raised but the CPU hasn't accepted yet. Real
+/// hardware moves a request from IRR to ISR only on accept (guest IF=1, IRQL
+/// below the vector's class), holding it in IRR while still pending. Doing
+/// the IRR->ISR transition at staging time (possibly IF=0) made HAL's IRR
+/// poll (HalpApicRequestInterrupt) see the bit vanish and re-request forever,
+/// an xAPIC NPF storm. So defer it: stage V_IRQ now, commit to ISR once the
+/// CPU has delivered it (V_IRQ auto-clears on accept). 0 = nothing armed.
+static INFLIGHT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+const INFLIGHT_VALID: u32 = 1 << 31;
+/// GSI of the in-flight interrupt for the level remote-IRR hand-off, or -1
+/// for an edge source (LAPIC timer, MSI/MSI-X, self-IPI).
+static INFLIGHT_GSI: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(-1);
+
+/// Raise `vector` as V_IRQ and arm its deferred in-service transition.
+/// `gsi` = Some for an IO-APIC-routed line (level / remote-IRR resolved on
+/// commit), None for an edge source (LAPIC timer, MSI/MSI-X, self-IPI).
+fn stage_virq(c: &mut VmcbControl, vector: u8, gsi: Option<u32>) {
+    raise_virq(c, vector);
+    INFLIGHT.store(vector as u32 | INFLIGHT_VALID, core::sync::atomic::Ordering::Relaxed);
+    INFLIGHT_GSI.store(gsi.map(|g| g as i32).unwrap_or(-1), core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Record a GSI-routed interrupt as in-service. Sets the LAPIC ISR (with
-/// the GSI's trigger mode reflected into TMR) and, for level lines, sets
-/// the IO-APIC remote-IRR so the line can't re-fire until its EOI clears
-/// it — exactly the hardware hand-off between IO-APIC and LAPIC.
-#[inline]
-fn deliver_gsi(gsi: u32, vector: u8) {
-    let level = ioapic::is_level(gsi as usize);
-    lapic::set_in_service(0, vector, level);
-    if level {
-        ioapic::set_remote_irr(gsi as usize);
+/// Commit the in-flight interrupt into service after the CPU has delivered it
+/// (caller checks V_IRQ is clear): move IRR->ISR (TMR for level) and, for a
+/// level GSI, set the IO-APIC remote-IRR so the line can't re-fire until EOI.
+/// No-op when nothing is armed.
+fn commit_inflight() {
+    let v = INFLIGHT.swap(0, core::sync::atomic::Ordering::Relaxed);
+    if v & INFLIGHT_VALID == 0 {
+        return;
+    }
+    let vector = (v & 0xFF) as u8;
+    let gsi = INFLIGHT_GSI.swap(-1, core::sync::atomic::Ordering::Relaxed);
+    if gsi >= 0 {
+        let level = ioapic::is_level(gsi as usize);
+        lapic::set_in_service(0, vector, level);
+        if level {
+            ioapic::set_remote_irr(gsi as usize);
+        }
+    } else {
+        lapic::set_in_service(0, vector, false);
     }
 }
 
@@ -124,6 +147,13 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
     hpet::shadow_tick();
 
     let c = unsafe { &mut (*vmcb).control };
+    // A V_IRQ we raised earlier and the CPU has since accepted (V_IRQ auto-
+    // clears on delivery) moves IRR->ISR here — deferred from staging so the
+    // request stays visible in IRR while still pending (IF=0 / high IRQL),
+    // matching real hardware and not tripping HAL's IRR poll.
+    if c.vintr & vintr::V_IRQ == 0 {
+        commit_inflight();
+    }
     // Don't clobber an event the handler itself just staged
     // (e.g., an exception forwarded from #PF intercept).
     if c.event_inj & VALID != 0 {
@@ -155,8 +185,7 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
     // guest then re-requests in a tight self-IPI storm, never progressing).
     if let Some(vector) = lapic::ipi_pending(0) {
         if throttle(&IPI_INJ, 16384) { crate::sprintln!("[inject] self-ipi vec=0x{:X}", vector); }
-        raise_virq(c, vector);
-        deliver_edge(vector);
+        stage_virq(c, vector, None);
         return;
     }
     // Stage the remaining maskable interrupts only when the guest has IF set
@@ -172,14 +201,12 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
     //    command completes so the driver's wait wakes immediately.
     if let Some(vector) = nvme::pending_irq() {
         if throttle(&NVME_INJ, 4096) { crate::sprintln!("[inject] nvme-msix vec=0x{:X}", vector); }
-        raise_virq(c, vector);
-        deliver_edge(vector);
+        stage_virq(c, vector, None);
         return;
     }
     if let Some(vector) = ahci::pending_irq() {
         if throttle(&AHCI_INJ, 4096) { crate::sprintln!("[inject] ahci-msi vec=0x{:X}", vector); }
-        raise_virq(c, vector);
-        deliver_edge(vector);
+        stage_virq(c, vector, None);
         return;
     }
     // PS/2 keyboard IRQ1 (legacy ISA line, no MADT override → GSI1). A typed
@@ -188,8 +215,7 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
         match gsi_vector(1) {
             Some(vector) => {
                 if throttle(&KBD_INJ, 4096) { crate::sprintln!("[inject] kbd-irq1 vec=0x{:X}", vector); }
-                raise_virq(c, vector);
-                deliver_gsi(1, vector);
+                stage_virq(c, vector, Some(1));
                 i8042::irq1_serviced();
                 return;
             }
@@ -202,8 +228,7 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
         match gsi_vector(12) {
             Some(vector) => {
                 if throttle(&MOUSE_INJ, 4096) { crate::sprintln!("[inject] mouse-irq12 vec=0x{:X}", vector); }
-                raise_virq(c, vector);
-                deliver_gsi(12, vector);
+                stage_virq(c, vector, Some(12));
                 i8042::irq12_serviced();
                 return;
             }
@@ -212,8 +237,7 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
     }
     // 1. LAPIC timer — periodic / one-shot scheduler tick.
     if let Some(vector) = lapic::timer_pending(0) {
-        raise_virq(c, vector);
-        deliver_edge(vector);
+        stage_virq(c, vector, None);
         lapic::timer_serviced(0);
         let n = LAPIC_TIMER_INJ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if n < 4 || n % 5000 == 0 {
@@ -229,8 +253,7 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
         match gsi_vector(hpet::timer0_gsi()) {
             Some(vector) => {
                 if throttle(&HPET_INJ, 16384) { crate::sprintln!("[inject] hpet vec=0x{:X}", vector); }
-                raise_virq(c, vector);
-                deliver_gsi(hpet::timer0_gsi(), vector);
+                stage_virq(c, vector, Some(hpet::timer0_gsi()));
                 hpet::timer0_serviced();
                 return;
             }
@@ -249,10 +272,9 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
         match irq0_vector() {
             Some(vector) => {
                 if throttle(&PIT_INJ, 8192) { crate::sprintln!("[inject] pit-irq0 vec=0x{:X}", vector); }
-                raise_virq(c, vector);
-                // IRQ0 is overridden to GSI2 on a real PC; reflect that
-                // entry's trigger mode (edge for the PIT tick).
-                deliver_gsi(2, vector);
+                // IRQ0 is overridden to GSI2 on a real PC; the GSI2 entry's
+                // trigger mode (edge for the PIT tick) is resolved on commit.
+                stage_virq(c, vector, Some(2));
                 pit::irq0_serviced();
                 return;
             }
@@ -276,8 +298,7 @@ pub unsafe fn stage_pending(vmcb: *mut Vmcb) {
         match gsi_vector(8) {
             Some(vector) => {
                 crate::sprintln!("[inject] rtc-irq8 vec=0x{:X}", vector);
-                raise_virq(c, vector);
-                deliver_gsi(8, vector);
+                stage_virq(c, vector, Some(8));
                 rtc::irq8_serviced();
                 return;
             }
